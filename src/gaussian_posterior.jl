@@ -117,11 +117,8 @@ function site_update(G :: GLMApprox,S :: GLMSites,i)
     qp,rp=m2exp(ms.μ,ms.σ2) 
     dq = qp - qc
     dr = rp - rc
-    #BUG HERE
     δ=log_partition(qc,rc)-log_partition(qp,rp)
-    δc=-log_partition(natural_parameters(G)...)+log_partition(cavity_naive(G,i)...)
-    @show δ,δc
-    ν=log(ms.z)+δc
+    ν=log(ms.z)+δ
     (dq=dq,dr=dr,lz=ν)
 end
 
@@ -177,5 +174,5 @@ end
 
 
 function log_partition(q :: Real,r :: Real)
-    .5*log(2π)-log(q)+(.5/q)*(r)^2
+    .5*(log(2π)-log(q)+(1/q)*(r)^2)
 end

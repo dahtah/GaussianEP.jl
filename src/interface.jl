@@ -1,12 +1,12 @@
 Distributions.MultivariateNormal(G :: AbstractGaussApprox) = MultivariateNormal(mean(G),Symmetric(cov(G)))
 
 function logreg(X,y)
-    ep_glm(X,y,BernLik())
+    ep_glm(X,y,Logit())
 end
 
-function ep_glm(X,y,l :: Likelihood,max_cycles=20,tol=1e-5)
+function ep_glm(X,y,l :: Likelihood;max_cycles=20,tol=1e-5,τ=.01)
     S=GLMSites(X,y,l)
-    G=GLMApprox(S)
+    G=GLMApprox(S,τ)
     fit!(G,S,max_cycles,tol)
     G
 end
@@ -59,4 +59,11 @@ end
 
 function log_ess(lw)
     2*logsumexp(lw)-logsumexp(2*lw)
+end
+
+#For debugging - log ML for Gaussian data
+function log_ml_gaussian(G,y)
+    n = length(y)
+    N = MultivariateNormal(zeros(n),Symmetric(G.X'*(G.Q0\G.X)+I))
+    logpdf(N,y)
 end

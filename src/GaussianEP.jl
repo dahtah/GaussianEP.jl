@@ -1,12 +1,15 @@
 module GaussianEP
 using FastGaussQuadrature,LinearAlgebra,Statistics,Distributions
-using GaussianProcesses,LogExpFunctions,SpecialFunctions
+using LogExpFunctions,SpecialFunctions
 
 
 include("quadrule.jl")
+include("likelihoods.jl")
 include("sites.jl")
 include("gaussian_posterior.jl")
 include("interface.jl")
 
-export QuadRule, GLMSites, BernLik, logreg, ep_glm
+
+
+export QuadRule, GLMSites, Logit, logreg, ep_glm,log_ml
 end
