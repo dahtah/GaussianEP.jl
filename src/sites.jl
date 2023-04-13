@@ -25,13 +25,38 @@ function GLMSites(X,y,lik::Likelihood)
     GLMSites{eltype(X),eltype(y),typeof(lik)}(X,y,lik,qr)
 end
 
+function GLMSites(X,y,lik::Likelihood,qr::QuadRule)
+    @assert length(y) == size(X,2)
+    GLMSites{eltype(X),eltype(y),typeof(lik)}(X,y,lik,qr)
+end
+
 
 
 function loglik(S :: GLMSites{TX,TY,L},i,x) where {TX, TY,L}
-    log_dens(S.lik,x,S.y[i])
+    log_dens(S.lik,x,S.y[i]) :: Float64
 end
 
+
 function hybrid_moments(S :: GLMSites,i,m,s2)
+    z=0.0
+    m1=0.0
+    m2=0.0
+    @inbounds for j in 1:length(S.qr.x)
+        xq = sqrt(s2)*S.qr.x[j] + m
+        wq = S.qr.w[j]
+        f = exp(loglik(S,i,xq))*wq
+        z+=f
+        tmp=f*xq
+        m1+=tmp
+        m2+=tmp*xq
+    end
+    μ = m1/z
+    σ2 = m2/z - μ^2 
+    (z=z,μ=μ,σ2=σ2)
+end
+
+
+function hybrid_moments_check(S :: GLMSites,i,m,s2)
     xq = sqrt(s2)*S.qr.x .+ m
     wq = S.qr.w
     f = [exp(loglik(S,i,x)) for x in xq]

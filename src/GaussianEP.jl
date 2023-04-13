@@ -11,5 +11,5 @@ include("interface.jl")
 
 
 
-export QuadRule, GLMSites, Logit, logreg, ep_glm,log_ml
+export QuadRule, GLMSites, Logit, PoisLik, ep_glm,log_ml
 end

@@ -14,9 +14,9 @@ end
 
 #Link function - move to struct
 logistic = (x)->1/(1+exp(-x))
-
+loglogistic = (x)->-log1pexp(-x)
 function log_dens(t::Logit, f, y)
-    return y ? log(logistic(f)) : log(1.0 - logistic(f)) 
+    return y ? loglogistic(f) : loglogistic(-f)  :: Float64
 end
 
 struct PoisLik <: Likelihood
@@ -32,9 +32,6 @@ struct BernLik{F} <: Likelihood
     invlink :: F
 end
 
-function BernLik(f)
-    BernLik{typeof(f)}(f)
-end
 
 #Bernoulli outcome with user-specified link
 function log_dens(bl::BernLik, f, y)

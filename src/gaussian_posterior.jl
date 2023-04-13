@@ -20,15 +20,17 @@ struct GLMApprox{T} <: AbstractGaussApprox
     Q :: Matrix{T}
     X :: Matrix{T}
     Σ :: Matrix{T}
+    μ :: Vector{T}
     logz :: Vector{T}
     r :: Vector{T}
     h :: Vector{T}
 end
+
 function Base.show(io::IO, G::GLMApprox)
     println("Approx. posterior of GLM form, with $(size(G.X,2)) sites, in dimension $(size(G.X,1))")
 end
 function Statistics.mean(G :: GLMApprox)
-    G.Σ*G.X*G.r
+    copy(G.μ)
 end
 Statistics.cov(G :: GLMApprox) = G.Σ
 function GLMApprox(S :: GLMSites,τ=.01)
@@ -46,8 +48,10 @@ function GLMApprox(S :: GLMSites,τ=.01)
     end
     Q=Q0 + S.X*Diagonal(h)*S.X'
     Σ=inv(Q)
+    μ=Σ*S.X*r
+
     logz=zeros(n)
-    GLMApprox{Float64}(Q0,Q,S.X,Σ,logz,r,h)
+    GLMApprox{Float64}(Q0,Q,S.X,Σ,μ,logz,r,h)
 end
 
 function dim(G :: GLMApprox{T}) where T
@@ -74,10 +78,11 @@ end
 
 #Linear response for site i
 function fitted(G :: GLMApprox,i)
-    G.X[:,i]'*G.Σ*(G.X*G.r)
+    G.X[:,i]'*G.μ
 end
+
 function fitted(G :: GLMApprox)
-    G.X'*G.Σ*(G.X*G.r)
+    C.X'*G.μ
 end
 
 function cavity(G :: GLMApprox, i)
@@ -86,7 +91,9 @@ function cavity(G :: GLMApprox, i)
     hi = G.h[i]
     α = (1-hi*s)
     sc = s+(hi*s^2 )/α
-    m = fitted(G,i)
+    #fitted: G.X[:,i]'*G.μ
+    #m = fitted(G,i)
+    m = xi'*G.μ
     γ = m-G.r[i]*s
     μ = γ*(α+G.h[i]*s)/α
     (μ=μ,σ2=sc)
@@ -94,19 +101,31 @@ end
 
 
 
+#for debugging
+function check_consistency(G :: GLMApprox)
+    @assert G.Σ ≈ inv(G.Q)
+    @assert G.μ ≈ G.Σ*G.X*G.r
+end
 
 function update_approx!(G :: GLMApprox{T},i,dq,dr,lz) where T <: Union{Float32,Float64}
+    # @info "Top"
+    # @assert G.μ ≈ G.Σ*G.X*G.r
+    #check_consistency(G)
     G.logz[i] = lz;
     n = nsites(G)
-    xi = G.X[:,i]
-    γ = -G.h[i] + dq
-    BLAS.ger!(γ,xi,xi,G.Q) #rank one update to Q
+    xi = @view G.X[:,i]
+    Sx = G.Σ*xi
+    xSx = dot(xi,Sx)
+    #γ = -G.h[i] + dq
+    δr = dr-G.r[i]
+    δq = dq-G.h[i]
+    α = -δq/(1+δq*xSx)
+    G.μ .+=  (δr + α*dot(G.μ,xi)+δr*α*xSx)*Sx
     G.r[i] = dr
     G.h[i] = dq
-    α = -γ/(1+γ*xi'*G.Σ*xi)
-    z = G.Σ*xi
+    BLAS.ger!(δq,xi,xi,G.Q) #rank one update to Q
     #rank one update to Σ
-    BLAS.ger!(α,z,z,G.Σ)
+    BLAS.ger!(α,Sx,Sx,G.Σ)
     return
 end
 
@@ -126,6 +145,14 @@ function natural_parameters(G:: GLMApprox)
     (G.Q0+G.X*Diagonal(G.h)*G.X',G.X*G.r)
 end
 
+function set_tau!(G :: GLMApprox,τ)
+    m = dim(G)
+    G.Q0 .= τ*Matrix(I,m,m)
+    G.Q .= G.Q0 + G.X*Diagonal(G.h)*G.X'
+    G.Σ .= inv(G.Q)
+    G.μ .= G.Σ*G.X*G.r
+end
+
 function cavity_naive(G :: GLMApprox,i)
     h = copy(G.h)
     r = copy(G.r)
@@ -133,6 +160,8 @@ function cavity_naive(G :: GLMApprox,i)
     r[i] = 0.0
     (G.Q0+G.X*Diagonal(h)*G.X',G.X*r)
 end
+
+
 
 function fit!(G :: GLMApprox,S :: GLMSites,maxcycles=24,tol=.001)
     m = mean(G)
@@ -143,10 +172,12 @@ function fit!(G :: GLMApprox,S :: GLMSites,maxcycles=24,tol=.001)
             update_approx!(G,i,dq,dr,lz)
         end
         delta= mean(abs.(m-mean(G)))
-        @info delta
+  #      @info delta
         (delta < tol ) && return
         m = mean(G)
     end
+    @info "Could not reach tolerance level. 
+Increase prior precision, or increase number of quadrature nodes"
     return 
 end
 
@@ -171,6 +202,23 @@ function partition(Q :: AbstractMatrix,r :: AbstractVector)
     sqrt( ((2π)^n)/det(Q))*exp(.5*r'*(Q\r))
 end
 
+function parallel_update(G :: GLMApprox,S :: GLMSites)
+    # μ = G.X'*mean(G)
+    # v = diag(G.X'*G.Σ*G.X)
+    n = nsites(G)
+    dq = zeros(n)
+    dr = zeros(n)
+    lz = zeros(n)
+    for i in 1:nsites(S)
+        dq[i],dr[i],lz[i]=site_update(G,S,i)
+        # ms=GaussianEP.hybrid_moments(S,i,μ[i],v[i])
+        # qc,rc=m2exp(μ[i],v[i])
+        # qp,rp=m2exp(ms.μ,ms.σ2) 
+        # dq[i] = qp - qc
+        # dr[i] = rp - rc
+    end
+    dq,dr,lz
+end
 
 
 function log_partition(q :: Real,r :: Real)

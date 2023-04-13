@@ -4,8 +4,9 @@ function logreg(X,y)
     ep_glm(X,y,Logit())
 end
 
-function ep_glm(X,y,l :: Likelihood;max_cycles=20,tol=1e-5,τ=.01)
-    S=GLMSites(X,y,l)
+function ep_glm(X,y,l :: Likelihood;max_cycles=20,tol=1e-5,τ=.01,nquad=20)
+    qr = QuadRule(nquad)
+    S=GLMSites(X,y,l,qr)
     G=GLMApprox(S,τ)
     fit!(G,S,max_cycles,tol)
     G
@@ -66,4 +67,23 @@ function log_ml_gaussian(G,y)
     n = length(y)
     N = MultivariateNormal(zeros(n),Symmetric(G.X'*(G.Q0\G.X)+I))
     logpdf(N,y)
+end
+
+
+
+
+function _regpath_tau(S,τ0,τ1;nsteps=10)
+    m,n = size(S.X)
+    G0=GLMApprox(S,τ0)
+    μs = zeros(m,nsteps)
+    lt = range(log(τ0),log(τ1),nsteps)
+    τs = exp.(lt)
+    lz = zeros(nsteps)
+    for (i,τ) = enumerate(τs)
+        set_tau!(G0,τ)
+        GaussianEP.fit!(G0,S)
+        μs[:,i] = mean(G0)
+        lz[i] = log_ml(G0)
+    end
+    τs,μs,lz
 end
