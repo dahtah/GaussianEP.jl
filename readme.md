@@ -1,6 +1,6 @@
 # GaussianEP.jl
 
-An experimental package for inference in latent Gaussian models via Expectation Propagation (Minka, 2001).
+A package for inference in latent Gaussian models via Expectation Propagation (Minka, 2001).
 
 Expectation Propagation (EP) can be used to form a Gaussian approximation to a distribution. Here, the target distribution is the distribution over the coefficients (weights) of a Generalised Linear Model, for instance a logistic regression.
 
@@ -76,7 +76,7 @@ Simon Barthelmé, CNRS, Gipsa-lab.
 
 A few useful references:
 
-Minka, T. P. (2001). A family of algorithms for approximate Bayesian inference (Doctoral dissertation, Massachusetts Institute of Technology).
-Herbrich (2005), On Gaussian Expectation Propagation, https://citeseerx.ist.psu.edu/document?repid=rep1&type=pdf&doi=17d40397aeedaeb61a2324ec52edaecb93093ca5
-Dehaene, G., & Barthelmé, S. (2018). Expectation propagation in the large data limit. Journal of the Royal Statistical Society. Series B (Statistical Methodology), 80(1), 199-217.
+- Minka, T. P. (2001). A family of algorithms for approximate Bayesian inference (Doctoral dissertation, Massachusetts Institute of Technology).
+- Herbrich (2005), On Gaussian Expectation Propagation, https://citeseerx.ist.psu.edu/document?repid=rep1&type=pdf&doi=17d40397aeedaeb61a2324ec52edaecb93093ca5
+- Dehaene, G., & Barthelmé, S. (2018). Expectation propagation in the large data limit. Journal of the Royal Statistical Society. Series B (Statistical Methodology), 80(1), 199-217.
 
