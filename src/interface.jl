@@ -3,12 +3,32 @@ Distributions.MultivariateNormal(G :: AbstractGaussApprox) = MultivariateNormal(
 function logreg(X,y)
     ep_glm(X,y,Logit())
 end
+"""
+    ep_glm(X,y,l :: Likelihood;max_cycles=20,tol=1e-5,τ=.01,nquad=20)
 
+Estimate a GLΜ using Expectation Propagation.
+
+# Arguments
+
+- X : design matrix, dimension p × n, where n is the number of observations ("examples"). If you want to include an intercept you should add it yourself.
+- y : observations, a vector of dimension n. 
+- l : likelihood for the observations. Logit() for Bernoulli data with logistic link. PoisLik() for Poisson likelihood with exponential link. See src/likelihoods.jl for more
+- max_cycles: max. number of times the EP algorithm can go through the observations.
+- tol: tolerance. Iterations stop when the estimated mean changes less than the tolerance.
+- τ: prior precision. The prior for the coefficients is βᵢ ∼ N(0,1/τ) for i in 1 … p. Set to τ=:autotune to set τ to its approximate maximum likelihood value.
+- nquad: number of quadrature nodes to use when computing approximate moments. Default, 20, increase if you encounter stability issues. More nodes: slower.
+"""
 function ep_glm(X,y,l :: Likelihood;max_cycles=20,tol=1e-5,τ=.01,nquad=20)
     qr = QuadRule(nquad)
     S=GLMSites(X,y,l,qr)
-    G=GLMApprox(S,τ)
-    fit!(G,S,max_cycles,tol)
+    if τ == :autotune
+        τ_opt,G=_autotune_tau(S,10,.01)
+        @info "Optimal value of prior precision τ : $(τ_opt)"
+    else
+
+        G=GLMApprox(S,τ)
+        fit!(G,S,max_cycles,tol)
+    end
     G
 end
 
@@ -87,3 +107,31 @@ function _regpath_tau(S,τ0,τ1;nsteps=10)
     end
     τs,μs,lz
 end
+
+function _autotune_tau(S,τ0,τ1;nsteps=10)
+    m,n = size(S.X)
+    G0=GLMApprox(S,τ0)
+    GaussianEP.fit!(G0,S)
+    μ = mean(G0)
+    C = cov(G0)
+    lt = range(log(τ0),log(τ1),nsteps)
+    τs = exp.(lt)
+    lz = log_ml(G0)
+    τ_opt=τ0
+    for (i,τ) = enumerate(τs)
+        set_tau!(G0,τ)
+        GaussianEP.fit!(G0,S)
+        nz = log_ml(G0)
+        if nz > lz
+            lz = nz
+            μ = mean(G0)
+            C = cov(G0)
+            τ_opt = τ
+        end
+    end
+    set_tau!(G0,τ_opt)
+    GaussianEP.fit!(G0,S)
+    (τ_opt=τ_opt,G=G0)
+end
+
+

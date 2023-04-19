@@ -2,7 +2,7 @@ using GaussianEP,LinearAlgebra,Statistics
 using Test
 
 const testdir = dirname(@__FILE__)
-tests = ["glm_gaussian","glm_dim1"]
+tests = ["glm_gaussian","glm_dim1","asymptotics"]
 
 @testset "GaussianEP" begin
     for t in tests

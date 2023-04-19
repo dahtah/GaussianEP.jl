@@ -91,15 +91,15 @@ function cavity(G :: GLMApprox, i)
     hi = G.h[i]
     α = (1-hi*s)
     sc = s+(hi*s^2 )/α
-    #fitted: G.X[:,i]'*G.μ
-    #m = fitted(G,i)
     m = xi'*G.μ
     γ = m-G.r[i]*s
     μ = γ*(α+G.h[i]*s)/α
     (μ=μ,σ2=sc)
 end
 
-
+function se(G :: GLMApprox)
+    sqrt.(diag(G.Σ))
+end
 
 #for debugging
 function check_consistency(G :: GLMApprox)

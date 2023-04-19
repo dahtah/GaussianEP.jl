@@ -9,7 +9,5 @@ include("sites.jl")
 include("gaussian_posterior.jl")
 include("interface.jl")
 
-
-
-export QuadRule, GLMSites, Logit, PoisLik, ep_glm,log_ml
+export QuadRule, GLMSites, Logit, PoisLik, ep_glm,log_ml,se
 end
