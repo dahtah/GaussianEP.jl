@@ -4,7 +4,7 @@ struct GLMSites{TX,TY,L <: Likelihood} <: AbstractSites
     X :: Matrix{TX}
     y :: Vector{TY}
     lik :: L
-    qr :: QuadRule
+    qr :: QuadRule{1}
 end
 
 nsites(S :: GLMSites) = length(S.y)
@@ -41,8 +41,8 @@ function hybrid_moments(S :: GLMSites,i,m,s2)
     z=0.0
     m1=0.0
     m2=0.0
-    @inbounds for j in 1:length(S.qr.x)
-        xq = sqrt(s2)*S.qr.x[j] + m
+    @inbounds for j in 1:length(S.qr.xq)
+        xq = sqrt(s2)*S.qr.xq[j] + m
         wq = S.qr.w[j]
         f = exp(loglik(S,i,xq))*wq
         z+=f
@@ -57,7 +57,7 @@ end
 
 
 function hybrid_moments_check(S :: GLMSites,i,m,s2)
-    xq = sqrt(s2)*S.qr.x .+ m
+    xq = sqrt(s2)*S.qr.xq .+ m
     wq = S.qr.w
     f = [exp(loglik(S,i,x)) for x in xq]
     z = dot(wq,f)
