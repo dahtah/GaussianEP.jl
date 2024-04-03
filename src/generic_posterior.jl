@@ -1,67 +1,36 @@
-#dumb type for now
-struct MyPDMat{T} <: AbstractPDMat{T}
-    S :: Matrix{T}
-end
-function Base.size(M :: MyPDMat)
-    size(M.S)
-end
-function Base.getindex(M :: MyPDMat,i,j)
-    M.S[i,j]
-end
-function Base.setindex!(M :: MyPDMat,v,i,j)
-    M.S[i,j] = v
-end
-function Base.inv(M :: MyPDMat)
-    inv(M.S)
-end
+# #dumb type for now
+# struct MyPDMat{T} <: AbstractPDMat{T}
+#     S :: Matrix{T}
+# end
+# function Base.:*(M::MyPDMat, x::AbstractVecOrMat)
+#     M.S*x
+# end
+# function Base.:/(M::MyPDMat, x::AbstractVecOrMat)
+#     M.S/x
+# end
+# function Base.size(M :: MyPDMat)
+#     size(M.S)
+# end
+# function Base.getindex(M :: MyPDMat,i,j)
+#     M.S[i,j]
+# end
+# function Base.setindex!(M :: MyPDMat,v,i,j)
+#     M.S[i,j] = v
+# end
+# function Base.inv(M :: MyPDMat)
+#     inv(M.S)
+# end
 
-#Add a A*D*A' term to matrix
-function addlowrank!(M :: MyPDMat,A,D)
-    BLAS.gemm!('N','N',1.,A,D*A',1.,M.S)
-end
-
-
-struct LinearMaps{T}
-    H :: Vector{T}
-end
-
-function dim(LM :: LinearMaps)
-    size(LM.H[1],1)
-end
-function Base.getindex(LM :: LinearMaps,i)
-    LM.H[i]
-end
-function Base.setindex!(LM :: LinearMaps,v,i)
-    LM.H[i] = v
-end
-
-function Base.length(LM :: LinearMaps)
-    length(LM.H)
-end
+# #Add a A*D*A' term to matrix
+# function addlowrank!(M :: MyPDMat,A,D)
+#     BLAS.gemm!('N','N',1.,A,D*A',1.,M.S)
+# end
 
 
-struct GenericSites{Tf,Th,D}
-    f :: Tf
-    A :: LinearMaps{Th}
-    qr :: QuadRule{D}
+function addlowrank!(M :: Matrix{Float64},A,D)
+    BLAS.gemm!('N','N',1.,A,D*A',1.,M)
 end
 
-function GenericSites(f,A :: LinearMaps,n::Integer,method=:gh)
-    qr = QuadRule(dim(A),n,method)
-    GenericSites(f,A,qr)
-end
-
-function dim(GS :: GenericSites)
-    dim(GS.A)
-end
-
-function nsites(GS :: GenericSites)
-    length(GS.A)
-end
-
-function npred(GS :: GenericSites)
-    size(GS.A[1],2)
-end
 
 #A generalisation of the GLM posterior of the form
 #q(x) ∝ exp(-.5 x' Q x + r'*x)
@@ -69,7 +38,7 @@ end
 #Each site is assumed to be of the form
 #f(x) = g(A_i x)
 #where A_i is a matrix of dimension D x n and D is small
-struct GenericApprox{Tsig <: AbstractPDMat,Tm,Th,Ts} <: AbstractGaussApprox
+struct GenericApprox{Tsig <: AbstractMatrix,Tm,Th,Ts} <: AbstractGaussApprox
     Σ :: Tsig
     μ :: Vector{Tm}
     r :: Vector{Tm}
@@ -96,7 +65,7 @@ function GenericApprox(S :: GenericSites,Q0 :: AbstractMatrix)
     m = npred(S)
     d = dim(S)
     #Q0=τ*Matrix(I,m,m)
-    Σ=MyPDMat(inv(Q0))
+    Σ=inv(Q0)
     μ=zeros(m)
     r=zeros(m)
     logz=zeros(n)
@@ -117,6 +86,7 @@ function cavity(G :: GenericApprox,i)
     MvNormal(mc,inv(Symmetric(Qc)))
     #mv,Qc
 end
+
 
 function cavity_marginal(G :: GenericApprox,i)
     Sm = G.S.A[i]*G.Σ*G.S.A[i]'
@@ -154,15 +124,12 @@ function update!(G::GenericApprox,i,α=0.0)
     Z = Matrix(G.Σ*G.S.A[i]')
 
     G.H[i] = α*G.H[i] + (1-α)*ct.δQ
-    #rn = linearshift(G) + G.S.A[i]'*(1-α)*(ct.δr - G.R[:,i])
     dr = G.S.A[i]'*(1-α)*(ct.δr - G.R[:,i])
     G.R[:,i] = α*G.R[:,i]+ (1-α)*ct.δr
     addlowrank!(G.Σ,Z,-inv(inv(D)+G.S.A[i]*Z))
     G.r .+= dr
-#    @assert G.r ≈ sum((G.S.A[i]'*(G.R[:,i]) for i in 1:nsites(G)))
-    mp  =G.Σ*sum((G.S.A[i]'*(G.R[:,i]) for i in 1:nsites(G)))
+#    mp  =G.Σ*sum((G.S.A[i]'*(G.R[:,i]) for i in 1:nsites(G)))
     G.μ .= G.Σ*G.r
-#    @show norm(G.μ - mp)
 end
 
 function run_ep!(G;α=0.0,npasses=4,schedule=1:nsites(G))
@@ -173,3 +140,78 @@ function run_ep!(G;α=0.0,npasses=4,schedule=1:nsites(G))
     end
 end
 
+function compute_update!(H :: HybridDistr, G :: GenericApprox,i;α=0.0)
+    B = Matrix(G.Σ*G.S.A[i]')
+    try
+        compute_cavity_marginal!(H,G,i,B)
+    catch
+        @warn "Site $(i) has non-positive variance, skipping"
+        return 
+    end
+    compute_moments!(H,G,i)
+    H.Nh.Q .-= H.Nm.Q
+    H.Nh.r .-= H.Nm.r
+    D=(1-α)*(H.Nh.Q - G.H[i])
+    G.H[i] = α*G.H[i] + (1-α)*H.Nh.Q
+    dr = G.S.A[i]'*(1-α)*(H.Nh.r - G.R[:,i])
+    G.R[:,i] = α*G.R[:,i]+ (1-α)*H.Nh.r
+    addlowrank!(G.Σ,B,-inv(inv(D)+G.S.A[i]*B))
+    G.r .+= dr
+    #G.μ .= G.Σ*G.r
+    BLAS.gemv!('N',1.0,G.Σ,G.r,0.0,G.μ)
+    return
+end
+
+function compute_cavity_marginal!(H :: HybridDistr, G :: GenericApprox,i,buf)
+    H.Nm.Q .= inv(Matrix(G.S.A[i]*buf)) - G.H[i]
+    H.Nm.r .= inv(Matrix(G.S.A[i]*buf))*(G.S.A[i]*G.μ) - G.R[:,i]
+    moments_from_exp!(H.Nm)
+end
+
+
+function chol_lower(a::Cholesky{F, T}) where F where T
+    return a.uplo === 'L' ? LowerTriangular{F,T}(a.factors) : LowerTriangular{F,T}(a.factors')
+end
+
+function unwhiten_quad!(H :: HybridDistr{D},G) where D
+    G.S.qr.xbuf .= chol_lower(H.Nm.L)*G.S.qr.xq
+end
+
+function compute_moments!(H :: HybridDistr{D},G :: GenericApprox,ind) where D
+    n = TiltedGaussians.nnodes(G.S.qr)
+    unwhiten_quad!(H,G)
+    z = 0.0
+    f = Base.Fix2(G.S.f,ind)
+    x = @MVector zeros(D)
+    H.Nh.μ .= 0.0
+    H.Nh.Σ .= 0.0
+    @inbounds for i in eachindex(G.S.qr.wq)
+        x .=  G.S.qr.xbuf[:,i] + H.Nm.μ
+        s = f(x)*G.S.qr.wq[i]
+        z += s
+        H.Nh.μ .+= s*x
+        for j in 1:D
+            for k in 1:D
+                H.Nh.Σ[j,k] += s*x[j]*x[k]
+            end
+        end
+    end
+    H.Nh.μ ./= z
+    for i in 1:D
+        for j in 1:D
+            H.Nh.Σ[i,j] = H.Nh.Σ[i,j]/z - H.Nh.μ[i]*H.Nh.μ[j]
+        end
+    end
+    exp_from_moments!(H.Nh)
+    return
+end
+
+#Compute contribution of site number i and store in H.Nh.Q and H.Nh.r 
+function compute_site_contribution!(H :: HybridDistr, G :: GenericApprox,i)
+    buf = G.Σ*G.S.A[i]'
+    compute_cavity_marginal!(H,G,i,buf)
+    compute_moments!(H,G,i)
+    H.Nh.Q .-= H.Nm.Q
+    H.Nh.r .-= H.Nm.r
+    return
+end
