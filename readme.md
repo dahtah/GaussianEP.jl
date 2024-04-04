@@ -6,7 +6,11 @@ Expectation Propagation (EP) can be used to form a Gaussian approximation to a d
 
 In GLMs, EP is typically much more accurate than other variational approximations, and much faster than MCMC.
 
-## Usage 
+## Status
+
+Experimental, right now it's possible to fit GLMs with a Gaussian prior, and even non-Gaussian (e.g., sparse) priors. Speed is decent but can certainly be improved. 
+
+## Usage
 
 Running a logistic regression is easy. Let us first generate some data. 
 ```{julia}
@@ -63,6 +67,10 @@ y = [(type=i,value=rand() > .5) for _ in 1:10 for i in 1:2]
 X = randn(2,length(y))
 G = ep_glm(X,y,MixedLik(Logit(),PoisLik()))
 ```
+
+## Author
+
+Simon Barthelmé, CNRS, Gipsa-lab.
 
 ## References
 

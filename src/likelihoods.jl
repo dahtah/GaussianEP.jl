@@ -27,7 +27,7 @@ function log_dens(poisson::PoisLik, f, y)
     return y*f - exp(f) - lgamma(1.0 + y)
 end
 
-#allow anonymous function as 
+#allow anonymous function as inverse link
 struct BernLik{F} <: Likelihood
     invlink :: F
 end
