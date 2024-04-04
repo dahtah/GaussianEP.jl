@@ -161,18 +161,41 @@ function cavity_naive(G :: GLMApprox,i)
     (G.Q0+G.X*Diagonal(h)*G.X',G.X*r)
 end
 
-
+function _approx_fit!(G :: GLMApprox,S :: GLMSites;α=.1,maxcycles=24,tol=.001)
+    dq = zeros(nsites(G))
+    dr = zeros(nsites(G))
+    #m = mean(G)
+    m = copy(G.h)
+    for c in 1:maxcycles
+        η = G.X'*mean(G)
+        v = diag(G.X'*cov(G)*G.X)
+        for i in 1:nsites(S)
+            ms = hybrid_moments(S,i,η[i],v[i])
+            qc,rc=m2exp(η[i],v[i])
+            qp,rp=m2exp(ms.μ,ms.σ2) 
+            dq[i] = qp-qc
+            dr[i] = rp-rc
+        end
+        G.h .= (1-α)*G.h+α*(dq)
+        G.r .= (1-α)*G.r+α*(dr)
+        G.Q .= G.Q0 + G.X*Diagonal(G.h)*G.X'
+        G.Σ .= inv(G.Q)
+        G.μ .= G.Σ*G.X*G.r
+        delta = mean(abs.(m-G.h))
+        @info "δ = $(delta)"
+        m .= G.h
+        (delta < tol ) && return
+    end
+end
 
 function fit!(G :: GLMApprox,S :: GLMSites,maxcycles=24,tol=.001)
     m = mean(G)
     for c in 1:maxcycles
         for i in 1:nsites(S)
             dq,dr,lz=site_update(G,S,i)
-            #ν = lz-log_partition(natural_parameters(G)...)+log_partition(cavity_naive(G,i)...)
             update_approx!(G,i,dq,dr,lz)
         end
-        delta= mean(abs.(m-mean(G)))
-  #      @info delta
+        delta = mean(abs.(m-mean(G)))
         (delta < tol ) && return
         m = mean(G)
     end
