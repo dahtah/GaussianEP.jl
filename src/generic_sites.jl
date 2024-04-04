@@ -16,17 +16,94 @@ function Base.length(LM :: LinearMaps)
     length(LM.H)
 end
 
-
-
-struct GenericSites{Tf,Th,D}
+#Signals that the moments are computed analytically, i.e.
+struct AnalyticMoments{Tf}
     f :: Tf
-    A :: LinearMaps{Th}
+end
+
+#Signals that the moments are computed via quadrature
+struct QuadratureMoments{Tf,D}
+    f :: Tf
     qr :: QuadRule{D}
 end
 
-function GenericSites(f,A :: LinearMaps,n::Integer,method=:gh)
-    qr = QuadRule(dim(A),n,method)
-    GenericSites(f,A,qr)
+function nodes(qm :: QuadratureMoments)
+    qm.qr.xq
+end
+
+
+
+function nodes_buffer(qm :: QuadratureMoments)
+    qm.qr.xbuf
+end
+
+function weights(qm :: QuadratureMoments)
+    qm.qr.wq
+end
+
+function nnodes(qm :: QuadratureMoments)
+    length(weights(qm))
+end
+
+
+
+function QuadratureMoments(f,d,n::Integer,method=:gh)
+    qr = QuadRule(d,n,method)
+    QuadratureMoments{typeof(f),d}(f,qr)
+end
+
+function unwhiten_quad!(H :: HybridDistr{D},qm) where D
+    nodes_buffer(qm) .= chol_lower(H.Nm.L)*nodes(qm)
+end
+
+
+function compute_moments!(H :: HybridDistr{D}, qm ::QuadratureMoments{Tf,D}, i) where D where Tf
+    n = nnodes(qm)
+    unwhiten_quad!(H,qm)
+    z = 0.0
+    #f = Base.Fix2(qm.f,ind)
+    x = @MVector zeros(D)
+    H.Nh.μ .= 0.0
+    H.Nh.Σ .= 0.0
+    @inbounds for i in 1:n
+        x .=  nodes_buffer(qm)[:,i] + H.Nm.μ
+        s = qm.f(x,i)*weights(qm)[i]
+        z += s
+        H.Nh.μ .+= s*x
+        for j in 1:D
+            for k in 1:D
+                H.Nh.Σ[j,k] += s*x[j]*x[k]
+            end
+        end
+    end
+    H.Nh.μ ./= z
+    for i in 1:D
+        for j in 1:D
+            H.Nh.Σ[i,j] = H.Nh.Σ[i,j]/z - H.Nh.μ[i]*H.Nh.μ[j]
+        end
+    end
+    exp_from_moments!(H.Nh)
+    return
+end
+
+function Base.show(io::IO, qm::QuadratureMoments{F,D}) where F where D
+    println("Quadrature rule for moment computation in dimension $(D). Number of nodes $(nnodes(qm))")
+end
+
+
+
+struct GenericSites{Tf,Th}
+    f :: Tf
+    A :: LinearMaps{Th}
+end
+
+function compute_moments!(H:: HybridDistr,S :: GenericSites{Tf,Th},i) where Tf where Th
+    compute_moments!(H,S.f,i)
+end
+
+
+function GenericSites(f,A :: LinearMaps{Th}) where Th
+    GenericSites{typeof(f),Th}(f,A)
 end
 
 function dim(GS :: GenericSites)
@@ -39,6 +116,14 @@ end
 
 function npred(GS :: GenericSites)
     size(GS.A[1],2)
+end
+
+function Base.show(io::IO, qm::GenericSites{F,D}) where F <: QuadratureMoments where D
+    println("Sites representation for EP with moment computation using quadrature. Number of sites $(nsites(qm)) ")
+end
+
+function Base.show(io::IO, qm::GenericSites{F,D}) where F <: AnalyticMoments where D
+    println("Sites representation for EP with analytic moment computation. Number of sites $(nsites(qm)) ")
 end
 
 

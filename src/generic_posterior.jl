@@ -1,31 +1,3 @@
-# #dumb type for now
-# struct MyPDMat{T} <: AbstractPDMat{T}
-#     S :: Matrix{T}
-# end
-# function Base.:*(M::MyPDMat, x::AbstractVecOrMat)
-#     M.S*x
-# end
-# function Base.:/(M::MyPDMat, x::AbstractVecOrMat)
-#     M.S/x
-# end
-# function Base.size(M :: MyPDMat)
-#     size(M.S)
-# end
-# function Base.getindex(M :: MyPDMat,i,j)
-#     M.S[i,j]
-# end
-# function Base.setindex!(M :: MyPDMat,v,i,j)
-#     M.S[i,j] = v
-# end
-# function Base.inv(M :: MyPDMat)
-#     inv(M.S)
-# end
-
-# #Add a A*D*A' term to matrix
-# function addlowrank!(M :: MyPDMat,A,D)
-#     BLAS.gemm!('N','N',1.,A,D*A',1.,M.S)
-# end
-
 
 function addlowrank!(M :: Matrix{Float64},A,D)
     BLAS.gemm!('N','N',1.,A,D*A',1.,M)
@@ -64,7 +36,6 @@ function GenericApprox(S :: GenericSites,Q0 :: AbstractMatrix)
     n = nsites(S)
     m = npred(S)
     d = dim(S)
-    #Q0=τ*Matrix(I,m,m)
     Σ=inv(Q0)
     μ=zeros(m)
     r=zeros(m)
@@ -133,9 +104,10 @@ function update!(G::GenericApprox,i,α=0.0)
 end
 
 function run_ep!(G;α=0.0,npasses=4,schedule=1:nsites(G))
+    H = HybridDistr{dim(G.S)}()
     for ip in 1:npasses
         for i in schedule
-            update!(G,i,α)
+            compute_update!(H,G,i,α=α)
         end
     end
 end
@@ -173,36 +145,9 @@ function chol_lower(a::Cholesky{F, T}) where F where T
     return a.uplo === 'L' ? LowerTriangular{F,T}(a.factors) : LowerTriangular{F,T}(a.factors')
 end
 
-function unwhiten_quad!(H :: HybridDistr{D},G) where D
-    G.S.qr.xbuf .= chol_lower(H.Nm.L)*G.S.qr.xq
-end
 
 function compute_moments!(H :: HybridDistr{D},G :: GenericApprox,ind) where D
-    n = TiltedGaussians.nnodes(G.S.qr)
-    unwhiten_quad!(H,G)
-    z = 0.0
-    f = Base.Fix2(G.S.f,ind)
-    x = @MVector zeros(D)
-    H.Nh.μ .= 0.0
-    H.Nh.Σ .= 0.0
-    @inbounds for i in eachindex(G.S.qr.wq)
-        x .=  G.S.qr.xbuf[:,i] + H.Nm.μ
-        s = f(x)*G.S.qr.wq[i]
-        z += s
-        H.Nh.μ .+= s*x
-        for j in 1:D
-            for k in 1:D
-                H.Nh.Σ[j,k] += s*x[j]*x[k]
-            end
-        end
-    end
-    H.Nh.μ ./= z
-    for i in 1:D
-        for j in 1:D
-            H.Nh.Σ[i,j] = H.Nh.Σ[i,j]/z - H.Nh.μ[i]*H.Nh.μ[j]
-        end
-    end
-    exp_from_moments!(H.Nh)
+    compute_moments!(H,G.S,ind)
     return
 end
 
