@@ -1,7 +1,25 @@
-
-function addlowrank!(M :: Matrix{Float64},A,D)
-    BLAS.gemm!('N','N',1.,A,D*A',1.,M)
+#should use BLAS (syrk! ?)
+function addlowrank!(M :: AbstractMatrix,A,sign=+1)
+    if sign == 1
+        M .= M+ A*A'
+    elseif sign == -1
+        M .= M - A*A'
+    end
 end
+
+function addlowrank!(M :: AbstractMatrix,A :: AbstractVecOrMat,B :: AbstractVecOrMat,sign=+1)
+    if sign == 1
+        M .= M + A*B
+    elseif sign == -1
+        M .= M - A*B
+    end
+end
+
+
+function addlowrank!(M :: Matrix{Float64},A :: AbstractVecOrMat,B :: AbstractVecOrMat,sign=+1)
+    BLAS.gemm!('N','N',float(sign),A,B,1.0,M)
+end
+
 
 
 #A generalisation of the GLM posterior of the form
@@ -12,6 +30,7 @@ end
 #where A_i is a matrix of dimension D x n and D is small
 struct GenericApprox{Tsig <: AbstractMatrix,Tm,Th,Ts} <: AbstractGaussApprox
     Σ :: Tsig
+    Q0 :: Matrix{Tm}
     μ :: Vector{Tm}
     r :: Vector{Tm}
     logz :: Vector{Tm}
@@ -20,8 +39,19 @@ struct GenericApprox{Tsig <: AbstractMatrix,Tm,Th,Ts} <: AbstractGaussApprox
     S :: Ts
 end
 
+
+dim(G :: GenericApprox) = length(G.μ)
 sites(G :: GenericApprox) = G.S
 nsites(G :: GenericApprox) = nsites(sites(G))
+
+#Recompute Σ and μ from site parameters
+function recompute_from_site_params!(G :: GenericApprox)
+    Q = G.Q0+sum((G.S.A[i]'*(G.H[i])*G.S.A[i] for i in 1:nsites(G)))
+    r = sum((G.S.A[i]'*(G.R[:,i]) for i in 1:nsites(G)))
+    G.Σ .= inv(Q)
+    G.r .= r
+    G.μ .= G.Σ*G.r
+end
 
 function linearshift(G :: GenericApprox)
     G.Σ\G.μ
@@ -35,20 +65,25 @@ end
 function GenericApprox(S :: GenericSites,Q0 :: AbstractMatrix)
     n = nsites(S)
     m = npred(S)
-    d = dim(S)
+    d = outdim(S)
     Σ=inv(Q0)
-    μ=zeros(m)
-    r=zeros(m)
-    logz=zeros(n)
-    R=zeros(d,n)
-    H=LinearMaps([zeros(d,d) for _ in 1:n])
-    GenericApprox(Σ,μ,r,logz,R,H,S)
+    μ=zeros(eltype(Q0),m)
+    r=zeros(eltype(Q0),m)
+    logz=zeros(eltype(Q0),n)
+    R=zeros(eltype(Q0),d,n)
+    H=LinearMaps([zeros(eltype(Q0),d,d) for _ in 1:n])
+    GenericApprox(Σ,Q0,μ,r,logz,R,H,S)
 end
 
 function Statistics.mean(G :: GenericApprox)
     copy(G.μ)
 end
 Statistics.cov(G :: GenericApprox) = G.Σ
+
+function Base.show(io::IO, G::GenericApprox)
+    println("Generic Gaussian approximation in dimension $(dim(G)).")
+end
+
 
 #naive implementation
 function cavity(G :: GenericApprox,i)
@@ -70,41 +105,24 @@ function cavity_marginal(G :: GenericApprox,i)
     #mv,Qc
 end
 
-function compute_site_contribution(G::GenericApprox,i)
-    mvc = cavity_marginal(G,i)
-    Qc = inv(mvc.Σ)
-    rc = Qc*mvc.μ
-    mm=TiltedGaussians.moments(mvc,G.S.qr,Base.Fix2(G.S.f,i))
-    Qh = inv(mm.C)
-    δQ = Qh-Qc
-    rh = Qh*mm.m
-    δr = rh - rc
-    δz = log_partition(Qh,rh)-log_partition(Qc,rc)
-    (δz=δz,δr=δr,δQ=δQ)
-end
+# function compute_site_contribution(G::GenericApprox,i)
+#     mvc = cavity_marginal(G,i)
+#     Qc = inv(mvc.Σ)
+#     rc = Qc*mvc.μ
+#     mm=TiltedGaussians.moments(mvc,G.S.qr,Base.Fix2(G.S.mc,i))
+#     Qh = inv(mm.C)
+#     δQ = Qh-Qc
+#     rh = Qh*mm.m
+#     δr = rh - rc
+#     δz = log_partition(Qh,rh)-log_partition(Qc,rc)
+#     (δz=δz,δr=δr,δQ=δQ)
+# end
 
 
-function compute_site_contribution_old(G::GenericApprox,i)
-    mc = cavity(G,i)
-    TiltedGaussians.contributions_ep(mc,G.S.qr,G.S.A[i],Base.Fix2(G.S.f,i))
-end
 
-function update!(G::GenericApprox,i,α=0.0)
-    ct = compute_site_contribution(G,i)
-    D=(1-α)*(ct.δQ - G.H[i])
-    Z = Matrix(G.Σ*G.S.A[i]')
-
-    G.H[i] = α*G.H[i] + (1-α)*ct.δQ
-    dr = G.S.A[i]'*(1-α)*(ct.δr - G.R[:,i])
-    G.R[:,i] = α*G.R[:,i]+ (1-α)*ct.δr
-    addlowrank!(G.Σ,Z,-inv(inv(D)+G.S.A[i]*Z))
-    G.r .+= dr
-#    mp  =G.Σ*sum((G.S.A[i]'*(G.R[:,i]) for i in 1:nsites(G)))
-    G.μ .= G.Σ*G.r
-end
 
 function run_ep!(G;α=0.0,npasses=4,schedule=1:nsites(G))
-    H = HybridDistr{dim(G.S)}()
+    H = HybridDistr{outdim(G.S),eltype(G.μ)}()
     for ip in 1:npasses
         for i in schedule
             compute_update!(H,G,i,α=α)
@@ -112,25 +130,27 @@ function run_ep!(G;α=0.0,npasses=4,schedule=1:nsites(G))
     end
 end
 
-function compute_update!(H :: HybridDistr, G :: GenericApprox,i;α=0.0)
-    B = Matrix(G.Σ*G.S.A[i]')
-    try
-        compute_cavity_marginal!(H,G,i,B)
-    catch
-        @warn "Site $(i) has non-positive variance, skipping"
-        return 
-    end
+function compute_update!(H :: HybridDistr{D,M,F}, G :: GenericApprox,i;α=0.0) where D where M where F
+    Ai = G.S.A[i]
+    B = Matrix(G.Σ*Ai')
+    Σtot = Symmetric(Ai*B)
+    compute_cavity_marginal!(H,G,i,B)
     compute_moments!(H,G,i)
-    H.Nh.Q .-= H.Nm.Q
-    H.Nh.r .-= H.Nm.r
-    D=(1-α)*(H.Nh.Q - G.H[i])
-    G.H[i] = α*G.H[i] + (1-α)*H.Nh.Q
-    dr = G.S.A[i]'*(1-α)*(H.Nh.r - G.R[:,i])
-    G.R[:,i] = α*G.R[:,i]+ (1-α)*H.Nh.r
-    addlowrank!(G.Σ,B,-inv(inv(D)+G.S.A[i]*B))
-    G.r .+= dr
-    #G.μ .= G.Σ*G.r
-    BLAS.gemv!('N',1.0,G.Σ,G.r,0.0,G.μ)
+    exp_from_moments!(H.Nh) #compute exponential parameters
+    H.Nh.Q .-= H.Nm.Q #contribution to precision from site
+    H.Nh.r .-= H.Nm.r #contribution to shift
+    δH =(1-α)*(H.Nh.Q - G.H[i])
+    G.H[i] .+= δH
+    dri = (1-α)*(H.Nh.r - G.R[:,i])
+    G.R[:,i] .+= dri
+    #S = inv(δH)+Σtot
+    #@show S
+    S = I+Σtot*δH
+    L = G.Σ*Ai'
+    addlowrank!(G.Σ,L*δH,S\L',-1)
+    G.r .+= Ai'*dri
+    G.μ .= G.Σ*G.r
+    #BLAS.gemv!('N',1.0,G.Σ,G.r,0.0,G.μ)
     return
 end
 
@@ -156,6 +176,7 @@ function compute_site_contribution!(H :: HybridDistr, G :: GenericApprox,i)
     buf = G.Σ*G.S.A[i]'
     compute_cavity_marginal!(H,G,i,buf)
     compute_moments!(H,G,i)
+    exp_from_moments!(H.Nh)
     H.Nh.Q .-= H.Nm.Q
     H.Nh.r .-= H.Nm.r
     return

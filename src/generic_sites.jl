@@ -1,10 +1,92 @@
-struct LinearMaps{T}
-    H :: Vector{T}
+
+#D-dimensional Gaussian using StaticArrays
+mutable struct StaticGaussian{D,M,F}
+    Σ :: MArray{Tuple{D,D},F,2,M}
+    L :: Cholesky{F,MMatrix{D,D,F,M}}
+    Q :: MArray{Tuple{D,D},F,2,M}
+    μ :: MArray{Tuple{D},F,1,D}
+    r :: MArray{Tuple{D},F,1,D}
 end
 
-function dim(LM :: LinearMaps)
-    size(LM.H[1],1)
+function StaticGaussian{D,F}() where D where F
+    Σ = @MArray zeros(F,D,D)
+    for i in 1:D
+        Σ[i,i] = 1.0
+    end
+    L = cholesky(Σ)
+    Q = @MArray zeros(F,D,D)
+    μ = @MArray zeros(F,D)
+    r = @MArray zeros(F,D)
+    S=StaticGaussian{D,D*D,F}(Σ,L,Q,μ,r)
+    exp_from_moments!(S)
+    S
 end
+
+
+function Base.show(io::IO, N::StaticGaussian{D}) where D
+    println("Gaussian distribution in dimension $(D). μ=$(N.μ), Σ=$(N.Σ), Q = $(N.Q), r = $(N.r)")
+end
+
+function moments_from_exp!(N  :: StaticGaussian)
+    N.Σ .= inv(N.Q)
+    N.L = cholesky(Symmetric(N.Σ))
+    N.μ .= N.Σ*N.r
+end
+
+function exp_from_moments!(N :: StaticGaussian)
+    N.Q .= inv(N.Σ)
+    N.r .= N.Q*N.μ
+end
+
+
+#some support for computations on marginals
+#to ensure minimal allocations during updates
+mutable struct HybridDistr{D,M,F}
+    Nm :: StaticGaussian{D,M,F}
+    Nh :: StaticGaussian{D,M,F}
+    zm :: F
+    zh :: F
+end
+
+function HybridDistr{D,F}() where D where F
+    Nm = StaticGaussian{D,F}()
+    Nh = StaticGaussian{D,F}()
+    HybridDistr{D,D*D,F}(Nm,Nh,F(0.0),F(0.0))
+end
+
+
+abstract type AbstractLinearMaps{Tf} end
+
+struct UnivariateLinearMaps{Tf} <: AbstractLinearMaps{Tf}
+    H :: Matrix{Tf};
+end
+function Base.show(io::IO, M::UnivariateLinearMaps)
+    println("A collection of $(length(M)) linear maps from ℜ^$(indim(M)) to ℜ, represented as a matrix")
+end
+
+indim(M :: UnivariateLinearMaps) = size(M.H,1)
+outdim(M :: UnivariateLinearMaps) =    1
+
+function Base.getindex(LM :: UnivariateLinearMaps,i)
+    reshape(LM.H[:,i],1,indim(LM))
+end
+
+function Base.setindex!(LM :: UnivariateLinearMaps,v,i)
+    LM.H[:,i] = v
+end
+
+function Base.length(LM :: UnivariateLinearMaps)
+    size(LM.H,2)
+end
+
+
+struct LinearMaps{Tf}  <: AbstractLinearMaps{Tf}
+    H :: Vector{Matrix{Tf}}
+end
+
+indim(LM :: LinearMaps) = size(LM.H[1],2)
+outdim(LM :: LinearMaps) = size(LM.H[1],1)
+
 function Base.getindex(LM :: LinearMaps,i)
     LM.H[i]
 end
@@ -16,10 +98,11 @@ function Base.length(LM :: LinearMaps)
     length(LM.H)
 end
 
-#Signals that the moments are computed analytically, i.e.
+#Signals that the moments are computed analytically
 struct AnalyticMoments{Tf}
     f :: Tf
 end
+
 
 #Signals that the moments are computed via quadrature
 struct QuadratureMoments{Tf,D}
@@ -56,18 +139,26 @@ function unwhiten_quad!(H :: HybridDistr{D},qm) where D
     nodes_buffer(qm) .= chol_lower(H.Nm.L)*nodes(qm)
 end
 
+function compute_moments!(H :: HybridDistr{D}, am ::AnalyticMoments{Tf}, ind) where D where Tf
+    z,m,C=am.f(H.Nm.μ,H.Nm.Σ)
+    H.Nh.μ = m
+    H.Nh.Σ = C
+    H.zh = z
+end
 
-function compute_moments!(H :: HybridDistr{D}, qm ::QuadratureMoments{Tf,D}, i) where D where Tf
+
+function compute_moments!(H :: HybridDistr{D,M,Ht}, qm ::QuadratureMoments{Tf,D}, ind) where D where Tf where M where Ht
     n = nnodes(qm)
-    unwhiten_quad!(H,qm)
+    #unwhiten_quad!(H,qm)
     z = 0.0
     #f = Base.Fix2(qm.f,ind)
-    x = @MVector zeros(D)
+    x = @MVector zeros(Ht,D)
     H.Nh.μ .= 0.0
     H.Nh.Σ .= 0.0
     @inbounds for i in 1:n
-        x .=  nodes_buffer(qm)[:,i] + H.Nm.μ
-        s = qm.f(x,i)*weights(qm)[i]
+        #x .=  nodes_buffer(qm)[:,i] + H.Nm.μ
+        x .= chol_lower(H.Nm.L)*nodes(qm)[:,i] + H.Nm.μ
+        s = qm.f(x,ind)*weights(qm)[i]
         z += s
         H.Nh.μ .+= s*x
         for j in 1:D
@@ -82,7 +173,6 @@ function compute_moments!(H :: HybridDistr{D}, qm ::QuadratureMoments{Tf,D}, i) 
             H.Nh.Σ[i,j] = H.Nh.Σ[i,j]/z - H.Nh.μ[i]*H.Nh.μ[j]
         end
     end
-    exp_from_moments!(H.Nh)
     return
 end
 
@@ -91,31 +181,30 @@ function Base.show(io::IO, qm::QuadratureMoments{F,D}) where F where D
 end
 
 
-
-struct GenericSites{Tf,Th}
-    f :: Tf
-    A :: LinearMaps{Th}
+#Holds info on moment computation and per-site linear maps
+struct GenericSites{Tf,Ta <: AbstractLinearMaps}
+    mc :: Tf
+    A :: Ta
 end
 
 function compute_moments!(H:: HybridDistr,S :: GenericSites{Tf,Th},i) where Tf where Th
-    compute_moments!(H,S.f,i)
+    compute_moments!(H,S.mc,i)
 end
 
 
-function GenericSites(f,A :: LinearMaps{Th}) where Th
-    GenericSites{typeof(f),Th}(f,A)
-end
+# function GenericSites(f,A :: LinearMaps{Th}) where Th
+#     GenericSites{typeof(f),Th}(f,A)
+# end
 
-function dim(GS :: GenericSites)
-    dim(GS.A)
-end
+outdim(GS :: GenericSites) = outdim(GS.A)
+
 
 function nsites(GS :: GenericSites)
     length(GS.A) :: Int
 end
 
 function npred(GS :: GenericSites)
-    size(GS.A[1],2)
+    indim(GS.A)
 end
 
 function Base.show(io::IO, qm::GenericSites{F,D}) where F <: QuadratureMoments where D
@@ -126,58 +215,5 @@ function Base.show(io::IO, qm::GenericSites{F,D}) where F <: AnalyticMoments whe
     println("Sites representation for EP with analytic moment computation. Number of sites $(nsites(qm)) ")
 end
 
-
-
-#D-dimensional Gaussian using StaticArrays
-mutable struct StaticGaussian{D,M}
-    Σ :: MArray{Tuple{D,D},Float64,2,M}
-    L :: Cholesky{Float64,MMatrix{D,D,Float64,M}}
-    Q :: MArray{Tuple{D,D},Float64,2,M}
-    μ :: MArray{Tuple{D},Float64,1,D}
-    r :: MArray{Tuple{D},Float64,1,D}
-end
-
-function StaticGaussian{D}() where D
-    Σ = @MArray zeros(D,D)
-    for i in 1:D
-        Σ[i,i] = 1.0
-    end
-    L = cholesky(Σ)
-    Q = @MArray zeros(D,D)
-    μ = @MArray zeros(D)
-    r = @MArray zeros(D)
-    StaticGaussian{D,D*D}(Σ,L,Q,μ,r)
-end
-
-
-function Base.show(io::IO, N::StaticGaussian{D}) where D
-    println("Gaussian distribution in dimension $(D). μ=$(N.μ), Σ=$(N.Σ), Q = $(N.Q), r = $(N.r)")
-end
-
-function moments_from_exp!(N  :: StaticGaussian)
-    N.Σ .= inv(N.Q)
-    N.L = cholesky(Symmetric(N.Σ))
-    N.μ .= N.Σ*N.r
-end
-
-function exp_from_moments!(N :: StaticGaussian)
-    N.Q .= inv(N.Σ)
-    N.r .= N.Q*N.μ
-end
-
-#some support for computations on marginals
-#to ensure minimal allocations during updates
-mutable struct HybridDistr{D}
-    Nm :: StaticGaussian{D}
-    Nh :: StaticGaussian{D}
-    zm :: Float64
-    zh :: Float64
-end
-
-function HybridDistr{D}() where D
-    Nm = StaticGaussian{D}()
-    Nh = StaticGaussian{D}()
-    HybridDistr{D}(Nm,Nh,0.0,0.0)
-end
 
 
