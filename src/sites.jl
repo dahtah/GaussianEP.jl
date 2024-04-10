@@ -43,7 +43,7 @@ function hybrid_moments(S :: GLMSites,i,m,s2)
     m2=0.0
     @inbounds for j in 1:length(S.qr.xq)
         xq = sqrt(s2)*S.qr.xq[j] + m
-        wq = S.qr.w[j]
+        wq = S.qr.wq[j]
         f = exp(loglik(S,i,xq))*wq
         z+=f
         tmp=f*xq
@@ -58,7 +58,7 @@ end
 
 function hybrid_moments_check(S :: GLMSites,i,m,s2)
     xq = sqrt(s2)*S.qr.xq .+ m
-    wq = S.qr.w
+    wq = S.qr.wq
     f = [exp(loglik(S,i,x)) for x in xq]
     z = dot(wq,f)
     wq /= z
