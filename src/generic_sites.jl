@@ -55,11 +55,12 @@ function HybridDistr{D,F}() where D where F
 end
 
 
-abstract type AbstractLinearMaps{Tf} end
+abstract type AbstractLinearMaps{Tf,Tm} end
 
-struct UnivariateLinearMaps{Tf} <: AbstractLinearMaps{Tf}
-    H :: Matrix{Tf};
+struct UnivariateLinearMaps{Tf,Tm <: AbstractMatrix{Tf}} <: AbstractLinearMaps{Tf,Tm}
+    H :: Tm;
 end
+
 function Base.show(io::IO, M::UnivariateLinearMaps)
     println("A collection of $(length(M)) linear maps from ℜ^$(indim(M)) to ℜ, represented as a matrix")
 end
@@ -80,8 +81,8 @@ function Base.length(LM :: UnivariateLinearMaps)
 end
 
 
-struct LinearMaps{Tf}  <: AbstractLinearMaps{Tf}
-    H :: Vector{Matrix{Tf}}
+struct LinearMaps{Tf,Tm <: AbstractVector{Tf}}  <: AbstractLinearMaps{Tf,Tm}
+    H :: Tm
 end
 
 indim(LM :: LinearMaps) = size(LM.H[1],2)
