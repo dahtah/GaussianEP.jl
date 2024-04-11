@@ -147,7 +147,7 @@ function unwhiten_quad!(H :: HybridDistr{D},qm) where D
 end
 
 function compute_moments!(H :: HybridDistr{D}, am ::AnalyticMoments{Tf}, ind) where D where Tf
-    z,m,C=am.f(H.Nm.μ,H.Nm.Σ)
+    z,m,C=am.f(H.Nm.μ,H.Nm.Σ,ind)
     H.Nh.μ .= m
     H.Nh.Σ .= C
     H.logzh = log(z)

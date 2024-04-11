@@ -172,5 +172,5 @@ end
 
 function logz(G :: GenericApprox)
     n = size(cov(G),1)
-    log_partition(Symmetric(inv(G.Σ)),G.r)-log_partition(Symmetric(G.Q0),zeros(n)) + sum(G.logz)
+    log_partition(Symmetric(inv(G.Σ)),G.r)-log_partition(Symmetric(G.Q0),G.r0) + sum(G.logz)
 end

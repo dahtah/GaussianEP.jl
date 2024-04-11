@@ -12,6 +12,7 @@ include("generic_sites.jl")
 include("generic_posterior.jl")
 
 include("interface.jl")
+include("glm.jl")
 
 export GLMSites, Logit, PoisLik, ep_glm,log_ml,se
 end
