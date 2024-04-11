@@ -19,7 +19,7 @@ Estimate a GLΜ using Expectation Propagation.
 - nquad: number of quadrature nodes to use when computing approximate moments. Default, 20, increase if you encounter stability issues. More nodes: slower.
 """
 function ep_glm(X,y,l :: Likelihood;max_cycles=20,tol=1e-5,τ=.01,nquad=20)
-    qr = QuadRule(nquad)
+    qr = QuadRule(1,nquad,:gh)
     S=GLMSites(X,y,l,qr)
     if τ == :autotune
         τ_opt,G=_autotune_tau(S,10,.01)

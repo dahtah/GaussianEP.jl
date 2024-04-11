@@ -22,6 +22,12 @@ function StaticGaussian{D,F}() where D where F
     S
 end
 
+#Compute log-partition function from exponential parameters
+function log_partition(N :: StaticGaussian{D,M,F}) where D where M where F
+    C=cholesky(Symmetric(N.Q))
+    .5*(D*log(2π)-logdet(C)+N.r'*(C\N.r))
+end
+
 
 function Base.show(io::IO, N::StaticGaussian{D}) where D
     println("Gaussian distribution in dimension $(D). μ=$(N.μ), Σ=$(N.Σ), Q = $(N.Q), r = $(N.r)")
@@ -44,8 +50,8 @@ end
 mutable struct HybridDistr{D,M,F}
     Nm :: StaticGaussian{D,M,F}
     Nh :: StaticGaussian{D,M,F}
-    zm :: F
-    zh :: F
+    logzm :: F
+    logzh :: F
 end
 
 function HybridDistr{D,F}() where D where F
@@ -81,8 +87,8 @@ function Base.length(LM :: UnivariateLinearMaps)
 end
 
 
-struct LinearMaps{Tf,Tm <: AbstractVector{Tf}}  <: AbstractLinearMaps{Tf,Tm}
-    H :: Tm
+struct LinearMaps{Tf,Tm <: AbstractMatrix{Tf}}  <: AbstractLinearMaps{Tf,Tm}
+    H :: Vector{Tm}
 end
 
 indim(LM :: LinearMaps) = size(LM.H[1],2)
@@ -142,9 +148,9 @@ end
 
 function compute_moments!(H :: HybridDistr{D}, am ::AnalyticMoments{Tf}, ind) where D where Tf
     z,m,C=am.f(H.Nm.μ,H.Nm.Σ)
-    H.Nh.μ = m
-    H.Nh.Σ = C
-    H.zh = z
+    H.Nh.μ .= m
+    H.Nh.Σ .= C
+    H.logzh = log(z)
 end
 
 
@@ -168,6 +174,7 @@ function compute_moments!(H :: HybridDistr{D,M,Ht}, qm ::QuadratureMoments{Tf,D}
             end
         end
     end
+    H.logzh = log(z)
     H.Nh.μ ./= z
     for i in 1:D
         for j in 1:D
@@ -187,6 +194,7 @@ struct GenericSites{Tf,Ta <: AbstractLinearMaps}
     mc :: Tf
     A :: Ta
 end
+
 
 function compute_moments!(H:: HybridDistr,S :: GenericSites{Tf,Th},i) where Tf where Th
     compute_moments!(H,S.mc,i)

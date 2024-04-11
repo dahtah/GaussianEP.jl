@@ -17,7 +17,7 @@ end
 
 
 function addlowrank!(M :: Matrix{Float64},A :: AbstractVecOrMat,B :: AbstractVecOrMat,sign=+1)
-    BLAS.gemm!('N','N',float(sign),A,B,1.0,M)
+    BLAS.gemm!('N','N',float(sign),Matrix(A),Matrix(B),1.0,M)
 end
 
 
@@ -31,6 +31,7 @@ end
 struct GenericApprox{Tsig <: AbstractMatrix,Tm,Th,Ts} <: AbstractGaussApprox
     Σ :: Tsig
     Q0 :: Matrix{Tm}
+    r0 :: Vector{Tm}
     μ :: Vector{Tm}
     r :: Vector{Tm}
     logz :: Vector{Tm}
@@ -47,7 +48,7 @@ nsites(G :: GenericApprox) = nsites(sites(G))
 #Recompute Σ and μ from site parameters
 function recompute_from_site_params!(G :: GenericApprox)
     Q = G.Q0+sum((G.S.A[i]'*(G.H[i])*G.S.A[i] for i in 1:nsites(G)))
-    r = sum((G.S.A[i]'*(G.R[:,i]) for i in 1:nsites(G)))
+    r = G.r0 + sum((G.S.A[i]'*(G.R[:,i]) for i in 1:nsites(G)))
     G.Σ .= inv(Q)
     G.r .= r
     G.μ .= G.Σ*G.r
@@ -62,17 +63,17 @@ function GenericApprox(S:: GenericSites,τ =0.01)
     GenericApprox(S,τ*Matrix(I,m,m))
 end
 
-function GenericApprox(S :: GenericSites,Q0 :: AbstractMatrix)
+function GenericApprox(S :: GenericSites,Q0 :: AbstractMatrix{T},r0 = zeros(T,size(Q0,1))) where T
     n = nsites(S)
     m = npred(S)
     d = outdim(S)
     Σ=inv(Q0)
-    μ=zeros(eltype(Q0),m)
-    r=zeros(eltype(Q0),m)
-    logz=zeros(eltype(Q0),n)
-    R=zeros(eltype(Q0),d,n)
-    H=LinearMaps([zeros(eltype(Q0),d,d) for _ in 1:n])
-    GenericApprox(Σ,Q0,μ,r,logz,R,H,S)
+    μ=Σ*r0
+    r=copy(r0)
+    logz=zeros(T,n)
+    R=zeros(T,d,n)
+    H=LinearMaps([zeros(T,d,d) for _ in 1:n])
+    GenericApprox(Σ,Q0,r0,μ,r,logz,R,H,S)
 end
 
 function Statistics.mean(G :: GenericApprox)
@@ -105,22 +106,6 @@ function cavity_marginal(G :: GenericApprox,i)
     #mv,Qc
 end
 
-# function compute_site_contribution(G::GenericApprox,i)
-#     mvc = cavity_marginal(G,i)
-#     Qc = inv(mvc.Σ)
-#     rc = Qc*mvc.μ
-#     mm=TiltedGaussians.moments(mvc,G.S.qr,Base.Fix2(G.S.mc,i))
-#     Qh = inv(mm.C)
-#     δQ = Qh-Qc
-#     rh = Qh*mm.m
-#     δr = rh - rc
-#     δz = log_partition(Qh,rh)-log_partition(Qc,rc)
-#     (δz=δz,δr=δr,δQ=δQ)
-# end
-
-
-
-
 function run_ep!(G;α=0.0,npasses=4,schedule=1:nsites(G))
     H = HybridDistr{outdim(G.S),eltype(G.μ)}()
     for ip in 1:npasses
@@ -137,24 +122,27 @@ function compute_update!(H :: HybridDistr{D,M,F}, G :: GenericApprox,i;α=0.0) w
     compute_cavity_marginal!(H,G,i,B)
     compute_moments!(H,G,i)
     exp_from_moments!(H.Nh) #compute exponential parameters
+
+    G.logz[i] = H.logzh + log_partition(H.Nm) - log_partition(H.Nh)
     H.Nh.Q .-= H.Nm.Q #contribution to precision from site
     H.Nh.r .-= H.Nm.r #contribution to shift
+    #@show H.Nh.r
+
+
     δH =(1-α)*(H.Nh.Q - G.H[i])
     G.H[i] .+= δH
     dri = (1-α)*(H.Nh.r - G.R[:,i])
     G.R[:,i] .+= dri
-    #S = inv(δH)+Σtot
-    #@show S
     S = I+Σtot*δH
     L = G.Σ*Ai'
     addlowrank!(G.Σ,L*δH,S\L',-1)
     G.r .+= Ai'*dri
     G.μ .= G.Σ*G.r
-    #BLAS.gemv!('N',1.0,G.Σ,G.r,0.0,G.μ)
     return
 end
 
 function compute_cavity_marginal!(H :: HybridDistr, G :: GenericApprox,i,buf)
+    #@show Matrix(G.S.A[i]*buf)
     H.Nm.Q .= inv(Matrix(G.S.A[i]*buf)) - G.H[i]
     H.Nm.r .= inv(Matrix(G.S.A[i]*buf))*(G.S.A[i]*G.μ) - G.R[:,i]
     moments_from_exp!(H.Nm)
@@ -180,4 +168,9 @@ function compute_site_contribution!(H :: HybridDistr, G :: GenericApprox,i)
     H.Nh.Q .-= H.Nm.Q
     H.Nh.r .-= H.Nm.r
     return
+end
+
+function logz(G :: GenericApprox)
+    n = size(cov(G),1)
+    log_partition(Symmetric(inv(G.Σ)),G.r)-log_partition(Symmetric(G.Q0),zeros(n)) + sum(G.logz)
 end
