@@ -1,6 +1,11 @@
-#new interface for setting up for glm models
+function glmlik(d :: D, z :: T, y, invlink) where T where D 
+    pdf(D(invlink(z)),y) :: T
+end
 
+
+#new interface for setting up for glm models
 function epglm(X,y,d :: Distribution;invlink=:default,nquad=40,τ0=0.01)
+    τ0 = float(τ0)
     Ai = UnivariateLinearMaps(X')
 
     D = typeof(d)
@@ -14,11 +19,9 @@ function epglm(X,y,d :: Distribution;invlink=:default,nquad=40,τ0=0.01)
             error("No default inverse link function for distribution $(D)")
         end
     end
-    f = (z,i)-> begin
-        μ=invlink(z[1])
-        pdf(D(μ),y[i])
-    end
+    f = (z,i)-> glmlik(d,z[1],y[i],invlink)
     qm = QuadratureMoments(f,1,nquad)
     S=GenericSites(qm,Ai)
     G=GenericApprox(S,τ0)
 end
+

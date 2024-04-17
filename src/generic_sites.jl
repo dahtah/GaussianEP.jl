@@ -151,6 +151,7 @@ function compute_moments!(H :: HybridDistr{D}, am ::AnalyticMoments{Tf}, ind) wh
     H.Nh.μ .= m
     H.Nh.Σ .= C
     H.logzh = log(z)
+    return true #computation was successful
 end
 
 
@@ -174,16 +175,33 @@ function compute_moments!(H :: HybridDistr{D,M,Ht}, qm ::QuadratureMoments{Tf,D}
             end
         end
     end
-    H.logzh = log(z)
-    H.Nh.μ ./= z
-    for i in 1:D
-        for j in 1:D
-            H.Nh.Σ[i,j] = H.Nh.Σ[i,j]/z - H.Nh.μ[i]*H.Nh.μ[j]
+    if (z == 0)
+        @warn "Cavity prior is severely miscalibrated, ignoring site for now"
+        H.logzh = 0.0
+        H.Nh.μ .= H.Nm.μ
+        H.Nh.Σ .= H.Nm.Σ
+        return false
+    else
+        H.logzh = log(z)
+        H.Nh.μ ./= z
+        tr = 0.0
+        for i in 1:D
+            for j in 1:D
+                H.Nh.Σ[i,j] = H.Nh.Σ[i,j]/z - H.Nh.μ[i]*H.Nh.μ[j]
+                
+            end
+            tr+=H.Nh.Σ[i,i]
         end
+        if (tr <= 1e-12)
+            @warn "Site is too informative relative to cavity prior, computations are imprecise, ignoring contribution for now"
+            H.logzh = 0.0
+            H.Nh.μ .= H.Nm.μ
+            H.Nh.Σ .= H.Nm.Σ
+            return false
+        end
+        return true
     end
-    return
 end
-
 function Base.show(io::IO, qm::QuadratureMoments{F,D}) where F where D
     println("Quadrature rule for moment computation in dimension $(D). Number of nodes $(nnodes(qm))")
 end
