@@ -155,7 +155,7 @@ function compute_moments!(H :: HybridDistr{D}, am ::AnalyticMoments{Tf}, ind,α)
 end
 
 
-function compute_moments!(H :: HybridDistr{D,M,Ht}, qm ::QuadratureMoments{Tf,D}, ind, α=1.0) where D where Tf where M where Ht
+function compute_moments!(H :: HybridDistr{D,M,Ht}, qm ::QuadratureMoments{Tf,D}, ind, α=1) where D where Tf where M where Ht
     n = nnodes(qm)
     #unwhiten_quad!(H,qm)
     z = 0.0
@@ -202,6 +202,7 @@ function compute_moments!(H :: HybridDistr{D,M,Ht}, qm ::QuadratureMoments{Tf,D}
         return true
     end
 end
+
 function Base.show(io::IO, qm::QuadratureMoments{F,D}) where F where D
     println("Quadrature rule for moment computation in dimension $(D). Number of nodes $(nnodes(qm))")
 end

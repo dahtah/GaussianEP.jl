@@ -113,13 +113,11 @@ function run_ep!(G;η=0.0,α=1.0,npasses=4,schedule=1:nsites(G))
     H = HybridDistr{outdim(G.S),eltype(G.μ)}()
     for ip in 1:npasses
         for i in schedule
-            status=compute_update!(H,G,i,α=α)
+            #@info "site $(i) at pass $(ip)"
+            status=compute_update!(H,G,i,α=α,η=η)
             if !status
                 @info "Ignoring site $(i) at pass $(ip)"
             end
-            #catch e
-            #    @warn "Update failed at site $(i) with error $(e)"
-            #end
         end
     end
     if any(G.ignored)
@@ -132,39 +130,20 @@ function compute_update!(H :: HybridDistr{D,M,F}, G :: GenericApprox,i;α=1.0,η
     B = Matrix(G.Σ*Ai')
     Σtot = Symmetric(Ai*B)
 
-    # compute_cavity_marginal!(H,G,i,B,α)
-    # compute_moments!(H,G,i,α)
-    # exp_from_moments!(H.Nh) #compute exponential parameters
-
-    # G.logz[i] = (1/α)*H.logzh + log_partition(H.Nm) - log_partition(H.Nh)
-    # H.Nh.Q .-= H.Nm.Q #contribution to precision from site
-    # H.Nh.r .-= H.Nm.r #contribution to shift
-    # #@show H.Nh.r
-
-
-    # δH =((1-η)/α)*(H.Nh.Q - G.H[i])
-    # G.H[i] .+= δH
-    # dri = ((1-η)/α)*(H.Nh.r - G.R[:,i])
-    # G.R[:,i] .+= dri
-    # S = I+Σtot*δH
-    # L = G.Σ*Ai'
-    # addlowrank!(G.Σ,L*δH,S\L',-1)
-    # G.r .+= Ai'*dri
-    # G.μ .= G.Σ*G.r
-    # return
-
-    compute_cavity_marginal!(H,G,i,B)
-    status=compute_moments!(H,G,i)
+    
+    compute_cavity_marginal!(H,G,i,B,α)
+    status=compute_moments!(H,G,i,α)
     if status
         G.ignored[i] = false
         exp_from_moments!(H.Nh) #compute exponential parameters
         G.logz[i] = H.logzh + log_partition(H.Nm) - log_partition(H.Nh)
-        H.Nh.Q .-= H.Nm.Q #contribution to precision from site
-        H.Nh.r .-= H.Nm.r #contribution to shift
+        H.Nh.Q .= (H.Nh.Q - H.Nm.Q)/α #contribution to precision from site
+        H.Nh.r .= (H.Nh.r - H.Nm.r)/α #contribution to shift
         #@show H.Nh.r
-        δH =(1-α)*(H.Nh.Q - G.H[i])
+        δH =(1-η)*(H.Nh.Q - G.H[i])
         G.H[i] .+= δH
-        dri = (1-α)*(H.Nh.r - G.R[:,i])
+#        @show δH
+        dri = (1-η)*(H.Nh.r - G.R[:,i])
         G.R[:,i] .+= dri
         S = I+Σtot*δH
         L = G.Σ*Ai'
@@ -176,7 +155,6 @@ function compute_update!(H :: HybridDistr{D,M,F}, G :: GenericApprox,i;α=1.0,η
         G.ignored[i] = true
         return false
     end
->>>>>>> 2c5b11e0d45a865bc3035cfb5ab3d4d842a5952a
 end
 
 function compute_cavity_marginal!(H :: HybridDistr, G :: GenericApprox,i,buf,α)
