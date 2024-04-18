@@ -38,6 +38,7 @@ struct GenericApprox{Tsig <: AbstractMatrix,Tm,Th,Ts} <: AbstractGaussApprox
     R :: Matrix{Tm}
     H :: Th
     S :: Ts
+    ignored :: BitVector
 end
 
 
@@ -73,7 +74,7 @@ function GenericApprox(S :: GenericSites,Q0 :: AbstractMatrix{T},r0 = zeros(T,si
     logz=zeros(T,n)
     R=zeros(T,d,n)
     H=LinearMaps([zeros(T,d,d) for _ in 1:n])
-    GenericApprox(Σ,Q0,r0,μ,r,logz,R,H,S)
+    GenericApprox(Σ,Q0,r0,μ,r,logz,R,H,S,trues(n))
 end
 
 function Statistics.mean(G :: GenericApprox)
@@ -112,8 +113,17 @@ function run_ep!(G;η=0.0,α=1.0,npasses=4,schedule=1:nsites(G))
     H = HybridDistr{outdim(G.S),eltype(G.μ)}()
     for ip in 1:npasses
         for i in schedule
-            compute_update!(H,G,i,α=α,η=η)
+            status=compute_update!(H,G,i,α=α)
+            if !status
+                @info "Ignoring site $(i) at pass $(ip)"
+            end
+            #catch e
+            #    @warn "Update failed at site $(i) with error $(e)"
+            #end
         end
+    end
+    if any(G.ignored)
+        @warn "Some sites were ignored during the last pass, results are unreliable. These sites may be outliers. If they are not, try increasing the number of passes, improving the prior, or increasing the accuracy of the quadrature"
     end
 end
 
@@ -121,26 +131,52 @@ function compute_update!(H :: HybridDistr{D,M,F}, G :: GenericApprox,i;α=1.0,η
     Ai = G.S.A[i]
     B = Matrix(G.Σ*Ai')
     Σtot = Symmetric(Ai*B)
-    compute_cavity_marginal!(H,G,i,B,α)
-    compute_moments!(H,G,i,α)
-    exp_from_moments!(H.Nh) #compute exponential parameters
 
-    G.logz[i] = (1/α)*H.logzh + log_partition(H.Nm) - log_partition(H.Nh)
-    H.Nh.Q .-= H.Nm.Q #contribution to precision from site
-    H.Nh.r .-= H.Nm.r #contribution to shift
-    #@show H.Nh.r
+    # compute_cavity_marginal!(H,G,i,B,α)
+    # compute_moments!(H,G,i,α)
+    # exp_from_moments!(H.Nh) #compute exponential parameters
+
+    # G.logz[i] = (1/α)*H.logzh + log_partition(H.Nm) - log_partition(H.Nh)
+    # H.Nh.Q .-= H.Nm.Q #contribution to precision from site
+    # H.Nh.r .-= H.Nm.r #contribution to shift
+    # #@show H.Nh.r
 
 
-    δH =((1-η)/α)*(H.Nh.Q - G.H[i])
-    G.H[i] .+= δH
-    dri = ((1-η)/α)*(H.Nh.r - G.R[:,i])
-    G.R[:,i] .+= dri
-    S = I+Σtot*δH
-    L = G.Σ*Ai'
-    addlowrank!(G.Σ,L*δH,S\L',-1)
-    G.r .+= Ai'*dri
-    G.μ .= G.Σ*G.r
-    return
+    # δH =((1-η)/α)*(H.Nh.Q - G.H[i])
+    # G.H[i] .+= δH
+    # dri = ((1-η)/α)*(H.Nh.r - G.R[:,i])
+    # G.R[:,i] .+= dri
+    # S = I+Σtot*δH
+    # L = G.Σ*Ai'
+    # addlowrank!(G.Σ,L*δH,S\L',-1)
+    # G.r .+= Ai'*dri
+    # G.μ .= G.Σ*G.r
+    # return
+
+    compute_cavity_marginal!(H,G,i,B)
+    status=compute_moments!(H,G,i)
+    if status
+        G.ignored[i] = false
+        exp_from_moments!(H.Nh) #compute exponential parameters
+        G.logz[i] = H.logzh + log_partition(H.Nm) - log_partition(H.Nh)
+        H.Nh.Q .-= H.Nm.Q #contribution to precision from site
+        H.Nh.r .-= H.Nm.r #contribution to shift
+        #@show H.Nh.r
+        δH =(1-α)*(H.Nh.Q - G.H[i])
+        G.H[i] .+= δH
+        dri = (1-α)*(H.Nh.r - G.R[:,i])
+        G.R[:,i] .+= dri
+        S = I+Σtot*δH
+        L = G.Σ*Ai'
+        addlowrank!(G.Σ,L*δH,S\L',-1)
+        G.r .+= Ai'*dri
+        G.μ .= G.Σ*G.r
+        return true
+    else
+        G.ignored[i] = true
+        return false
+    end
+>>>>>>> 2c5b11e0d45a865bc3035cfb5ab3d4d842a5952a
 end
 
 function compute_cavity_marginal!(H :: HybridDistr, G :: GenericApprox,i,buf,α)
@@ -158,7 +194,6 @@ end
 
 function compute_moments!(H :: HybridDistr{D},G :: GenericApprox,ind,α) where D
     compute_moments!(H,G.S,ind,α)
-    return
 end
 
 #Compute contribution of site number i and store in H.Nh.Q and H.Nh.r 
