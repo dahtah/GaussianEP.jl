@@ -106,32 +106,34 @@ function cavity_marginal(G :: GenericApprox,i)
     #mv,Qc
 end
 
-function run_ep!(G;α=0.0,npasses=4,schedule=1:nsites(G))
+#η is a damping parameter
+#α is the power EP parameter
+function run_ep!(G;η=0.0,α=1.0,npasses=4,schedule=1:nsites(G))
     H = HybridDistr{outdim(G.S),eltype(G.μ)}()
     for ip in 1:npasses
         for i in schedule
-            compute_update!(H,G,i,α=α)
+            compute_update!(H,G,i,α=α,η=η)
         end
     end
 end
 
-function compute_update!(H :: HybridDistr{D,M,F}, G :: GenericApprox,i;α=0.0) where D where M where F
+function compute_update!(H :: HybridDistr{D,M,F}, G :: GenericApprox,i;α=1.0,η=0.0) where D where M where F
     Ai = G.S.A[i]
     B = Matrix(G.Σ*Ai')
     Σtot = Symmetric(Ai*B)
-    compute_cavity_marginal!(H,G,i,B)
-    compute_moments!(H,G,i)
+    compute_cavity_marginal!(H,G,i,B,α)
+    compute_moments!(H,G,i,α)
     exp_from_moments!(H.Nh) #compute exponential parameters
 
-    G.logz[i] = H.logzh + log_partition(H.Nm) - log_partition(H.Nh)
+    G.logz[i] = (1/α)*H.logzh + log_partition(H.Nm) - log_partition(H.Nh)
     H.Nh.Q .-= H.Nm.Q #contribution to precision from site
     H.Nh.r .-= H.Nm.r #contribution to shift
     #@show H.Nh.r
 
 
-    δH =(1-α)*(H.Nh.Q - G.H[i])
+    δH =((1-η)/α)*(H.Nh.Q - G.H[i])
     G.H[i] .+= δH
-    dri = (1-α)*(H.Nh.r - G.R[:,i])
+    dri = ((1-η)/α)*(H.Nh.r - G.R[:,i])
     G.R[:,i] .+= dri
     S = I+Σtot*δH
     L = G.Σ*Ai'
@@ -141,10 +143,10 @@ function compute_update!(H :: HybridDistr{D,M,F}, G :: GenericApprox,i;α=0.0) w
     return
 end
 
-function compute_cavity_marginal!(H :: HybridDistr, G :: GenericApprox,i,buf)
+function compute_cavity_marginal!(H :: HybridDistr, G :: GenericApprox,i,buf,α)
     #@show Matrix(G.S.A[i]*buf)
-    H.Nm.Q .= inv(Matrix(G.S.A[i]*buf)) - G.H[i]
-    H.Nm.r .= inv(Matrix(G.S.A[i]*buf))*(G.S.A[i]*G.μ) - G.R[:,i]
+    H.Nm.Q .= inv(Matrix(G.S.A[i]*buf)) - α*G.H[i]
+    H.Nm.r .= inv(Matrix(G.S.A[i]*buf))*(G.S.A[i]*G.μ) - α*G.R[:,i]
     moments_from_exp!(H.Nm)
 end
 
@@ -154,16 +156,16 @@ function chol_lower(a::Cholesky{F, T}) where F where T
 end
 
 
-function compute_moments!(H :: HybridDistr{D},G :: GenericApprox,ind) where D
-    compute_moments!(H,G.S,ind)
+function compute_moments!(H :: HybridDistr{D},G :: GenericApprox,ind,α) where D
+    compute_moments!(H,G.S,ind,α)
     return
 end
 
 #Compute contribution of site number i and store in H.Nh.Q and H.Nh.r 
-function compute_site_contribution!(H :: HybridDistr, G :: GenericApprox,i)
+function compute_site_contribution!(H :: HybridDistr, G :: GenericApprox,i,α=1.0)
     buf = G.Σ*G.S.A[i]'
-    compute_cavity_marginal!(H,G,i,buf)
-    compute_moments!(H,G,i)
+    compute_cavity_marginal!(H,G,i,buf,α)
+    compute_moments!(H,G,i,α)
     exp_from_moments!(H.Nh)
     H.Nh.Q .-= H.Nm.Q
     H.Nh.r .-= H.Nm.r

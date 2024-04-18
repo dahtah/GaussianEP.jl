@@ -146,15 +146,15 @@ function unwhiten_quad!(H :: HybridDistr{D},qm) where D
     nodes_buffer(qm) .= chol_lower(H.Nm.L)*nodes(qm)
 end
 
-function compute_moments!(H :: HybridDistr{D}, am ::AnalyticMoments{Tf}, ind) where D where Tf
-    z,m,C=am.f(H.Nm.μ,H.Nm.Σ,ind)
+function compute_moments!(H :: HybridDistr{D}, am ::AnalyticMoments{Tf}, ind,α) where D where Tf
+    z,m,C=am.f(H.Nm.μ,H.Nm.Σ,ind,α)
     H.Nh.μ .= m
     H.Nh.Σ .= C
     H.logzh = log(z)
 end
 
 
-function compute_moments!(H :: HybridDistr{D,M,Ht}, qm ::QuadratureMoments{Tf,D}, ind) where D where Tf where M where Ht
+function compute_moments!(H :: HybridDistr{D,M,Ht}, qm ::QuadratureMoments{Tf,D}, ind, α=1.0) where D where Tf where M where Ht
     n = nnodes(qm)
     #unwhiten_quad!(H,qm)
     z = 0.0
@@ -165,7 +165,7 @@ function compute_moments!(H :: HybridDistr{D,M,Ht}, qm ::QuadratureMoments{Tf,D}
     @inbounds for i in 1:n
         #x .=  nodes_buffer(qm)[:,i] + H.Nm.μ
         x .= chol_lower(H.Nm.L)*nodes(qm)[:,i] + H.Nm.μ
-        s = qm.f(x,ind)*weights(qm)[i]
+        s = (qm.f(x,ind)^α)*weights(qm)[i]
         z += s
         H.Nh.μ .+= s*x
         for j in 1:D
@@ -196,8 +196,8 @@ struct GenericSites{Tf,Ta <: AbstractLinearMaps}
 end
 
 
-function compute_moments!(H:: HybridDistr,S :: GenericSites{Tf,Th},i) where Tf where Th
-    compute_moments!(H,S.mc,i)
+function compute_moments!(H:: HybridDistr,S :: GenericSites{Tf,Th},i,α=1.0) where Tf where Th
+    compute_moments!(H,S.mc,i,α)
 end
 
 

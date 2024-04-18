@@ -2,14 +2,14 @@
 EP = GaussianEP
 
 #For debugging purposes: compute exactly the moments of a
-#f(x,j) = exp(-.5*j*x'*x - j*r)
+#f(x,j) = exp(-.5*j*x'*x - j*r)^α
 #under a N(μ,σ2) Gaussian
-function moments_gaussian(μ,σ2,j)
+function moments_gaussian(μ,σ2,j,α)
     N = Normal(μ,σ2)
     q = 1/σ2
     r = q*μ
-    qt = q+j
-    rt = r-j
+    qt = q+α*j
+    rt = r-α*j
     z = exp(EP.log_partition(qt,rt) - EP.log_partition(q,r))
     sh = 1/qt
     rh = sh*rt
@@ -24,7 +24,7 @@ function check_EP_gaussian(n,d;τ=0.01,α=0,npasses=10,univar=true)
     Qt = Q0+sum([i*Ai[i]'*Ai[i] for i in 1:n]) #True posterior precision
     rt = vec(r0-sum([Ai[i]'*i for i in 1:n])) #True posterior shift
     #Set up moment computation
-    mm = EP.AnalyticMoments((μ,σ,i)->moments_gaussian(μ[1],σ[1],i))
+    mm = EP.AnalyticMoments((μ,σ,i,α)->moments_gaussian(μ[1],σ[1],i,α))
     #Two possible ways of setting up the linear maps
     M = (univar ?  EP.UnivariateLinearMaps(Matrix(reduce(vcat,Ai)')) :  EP.LinearMaps(Ai))
     S=EP.GenericSites(mm,M);
@@ -37,11 +37,13 @@ end
 
 @testset "ep_gaussian" begin
     for d = [2,3,4]
-        for α = [0.,0.2,0.5]
-            for n = 1:5
-                for τ = [0.1,2.]
-                    for uni = [true,false]
+        for n = 1:5
+            for τ = [0.1,2.]
+                for uni = [true,false]
+                    for α = [1.,0.5,.1]
+                        @show α
                         a,b,c = check_EP_gaussian(n,d,α=α,τ=τ,npasses=50,univar=uni)
+                        @show a,b,c
                         @assert a < 1e-8 #log partition function is correct
                         @assert b < 1e-8 #mean is correct
                         @assert c < 1e-8 #cov is correct

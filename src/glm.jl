@@ -20,5 +20,6 @@ function epglm(X,y,d :: Distribution;invlink=:default,nquad=40,τ0=0.01)
     end
     qm = QuadratureMoments(f,1,nquad)
     S=GenericSites(qm,Ai)
-    G=GenericApprox(S,τ0)
+    G=GenericApprox(S,float(τ0))
 end
+
