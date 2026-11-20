@@ -47,14 +47,26 @@ end
 
 # --- model builders ---
 
-# GLM: site i is the i-th column of X, seen as a 1×p matrix
+"""
+    glm_model(X, y, lik, τ=0.01)
+
+GLM as an `EPModel`: prior `N(0, τ⁻¹I)` on the p coefficients and one rank-1
+site per observation, `A_i = X[:,i]'`, `f_i(η) = exp(log_dens(lik, η, y_i))`.
+`X` is p×n.
+"""
 function glm_model(X::AbstractMatrix, y, lik, τ=0.01)
     p, n = size(X)
     sites = [Site(reshape(X[:,i], 1, p), y[i], lik) for i in 1:n]
     EPModel(τ*Matrix{Float64}(I, p, p), sites)
 end
 
-# Ising: p(x) ∝ exp(-.5 x'Hx + field'x) ∏_i I(|x_i| = 1)
+"""
+    ising_model(H; field=zeros(size(H,1)))
+
+Ising model `p(x) ∝ exp(-.5 x'Hx + field'x) ∏ᵢ I(|xᵢ| = 1)` as an `EPModel`:
+the Gaussian part is the base measure (`Q0 = H`, `r0 = field`) and each
+hypercube constraint is a unary `IsingLik` site with analytic tilted moments.
+"""
 function ising_model(H::AbstractMatrix; field=zeros(size(H,1)))
     m = size(H, 1)
     sites = [Site(_unit_row(i, m), nothing, IsingLik()) for i in 1:m]
@@ -76,6 +88,19 @@ end
 # necessary to break the reflection symmetry — with only particle 1 pinned
 # and V even, E[x_i] = 0 for every free particle and EP stays at the
 # symmetric saddle. Pass pin2=nothing to pin only particle 1.
+"""
+    gas_model(np, d; β=1.0, H=r->r^2, V=η->0.5*sum(abs2,η), τ0=1e-6, pin2=ones(d))
+
+Gas of `np` particles in `R^d` as an `EPModel`:
+`p(x) ∝ exp(-β Σ_{i<j} H(‖x_i - x_j‖)) exp(Σ_i V(x_i))` with a weak Gaussian
+base of precision `τ0`. Pairwise factors are rank-`d` sites
+`A_ij = [.. I_d .. -I_d ..]`, unary confining factors are rank-`d` sites
+`A_i = [.. I_d ..]`. The full posterior is multimodal, so EP can only center
+on one local minimum: particle 1 is pinned at the origin and a second
+particle at `pin2` (a d-vector hyperparameter) breaks the reflection
+symmetry — `pin2=nothing` pins only particle 1, in which case EP stays at
+the symmetric saddle with `μ = 0`.
+"""
 function gas_model(np::Int, d::Int; β=1.0, H=(r)->r^2, V=(η)->0.5*sum(abs2, η), τ0=1e-6, pin2=ones(d))
     npinned = pin2 === nothing ? 1 : 2
     mfull = np*d
@@ -120,6 +145,16 @@ end
 # base measure — Q0 = X'X/σ² (+ τ0 ridge to keep it PD), r0 = X'y/σ² — and
 # each Laplace prior is a unary site with A_i = e_i', so the non-Gaussian
 # sites live in the prior, not in the likelihood.
+"""
+    sparse_lm(X, y, λ, σ2=1.0; τ0=1e-8)
+
+Sparse linear model (Seeger 2008): `y = X'a + ε`, `ε ~ N(0, σ²I)`, with
+independent Laplace priors `p(a_i) = (λ/2) exp(-λ|a_i|)` on the coefficients.
+`X` is p×n (p coefficients, n observations). The Gaussian likelihood is the
+base measure — `Q0 = XX'/σ²` (+ `τ0` ridge to keep it PD), `r0 = Xy/σ²` — and
+each Laplace prior is a unary site with `A_i = e_i'`, so the non-Gaussian
+sites live in the prior, not in the likelihood.
+"""
 function sparse_lm(X::AbstractMatrix, y::AbstractVector, λ::Real, σ2::Real=1.0; τ0=1e-8)
     p, n = size(X)
     length(y) == n || throw(DimensionMismatch("length(y) must equal size(X,2)"))
@@ -134,6 +169,15 @@ end
 # (w = spike probability). One mixture site per coefficient; tilted moments
 # are analytic (moments.jl). The exact posterior is a mixture of 2^p Gaussians
 # (one per active subset), which makes m ≤ 3 cases checkable in closed form.
+"""
+    spike_slab_lm(X, y, w, τ2, σ2=1.0; τ0=1e-8)
+
+Spike-and-slab linear model: same Gaussian likelihood as `sparse_lm`, but
+each coefficient has the mixture prior `p(a_i) = w δ(a_i) + (1-w) N(a_i; 0, τ2)`
+(`w` = spike probability). One `SpikeSlabLik` site per coefficient; tilted
+moments are analytic. The exact posterior is a mixture of `2^p` Gaussians
+(one per active subset), which makes `p ≤ 3` cases checkable in closed form.
+"""
 function spike_slab_lm(X::AbstractMatrix, y::AbstractVector, w::Real, τ2::Real, σ2::Real=1.0; τ0=1e-8)
     p, n = size(X)
     length(y) == n || throw(DimensionMismatch("length(y) must equal size(X,2)"))

@@ -9,6 +9,12 @@ function log_dens(glik::GLik, f, y)
     return -.5*(f-y)^2 - .5*log(2π)
 end
 
+"""
+    Logit()
+
+Bernoulli likelihood with logistic link: `log_dens(Logit(), η, y)` is
+`log σ(η)` for `y == true` and `log(1 - σ(η))` otherwise.
+"""
 struct Logit <: Likelihood
 end
 
@@ -19,6 +25,12 @@ function log_dens(t::Logit, f, y)
     return y ? loglogistic(f) : loglogistic(-f)
 end
 
+"""
+    PoisLik()
+
+Poisson likelihood with exponential (log) link:
+`log_dens(PoisLik(), η, y) = y*η - exp(η) - lgamma(1+y)`.
+"""
 struct PoisLik <: Likelihood
 end
 
@@ -41,6 +53,12 @@ end
 
 #Ising hard constraint: factor I(|η| = 1). Tilted moments are analytic
 #(see moments.jl), so quadrature is never called on this likelihood.
+"""
+    IsingLik()
+
+Hard constraint `|η| = 1` (Ising spin). Tilted moments are analytic
+(`tanh`), so quadrature is never called on this likelihood.
+"""
 struct IsingLik <: Likelihood
 end
 
@@ -49,6 +67,12 @@ function log_dens(::IsingLik, η, y)
 end
 
 #multivariate Gaussian likelihood N(y; η, I_d), any dimension d
+"""
+    GaussLik()
+
+Multivariate Gaussian likelihood `N(y; η, I_d)` of any rank `d`:
+`log_dens(GaussLik(), η, y) = -.5*sum(abs2, η .- y) - .5*d*log(2π)`.
+"""
 struct GaussLik <: Likelihood
 end
 
@@ -58,6 +82,13 @@ end
 
 #pairwise repulsion factor exp(-β H(||η - center||)) for a gas model,
 #η = x_i - x_j; center is used when one of the two particles is pinned
+"""
+    RepulseLik(β, H; center=nothing)
+
+Pairwise repulsion factor `exp(-β H(‖η - center‖))` for a gas model, with
+`η = x_i - x_j`; `center=nothing` means the origin (used when one of the two
+particles is pinned).
+"""
 struct RepulseLik{F,C} <: Likelihood
     β :: Float64
     H :: F       # H(r) for r ≥ 0
@@ -69,6 +100,11 @@ RepulseLik(β, H) = RepulseLik(β, H, nothing)
 log_dens(r::RepulseLik, η, y) = -r.β * r.H(norm(r.center === nothing ? η : η .- r.center))
 
 #unary confining factor exp(-V(η))
+"""
+    ConfineLik(V)
+
+Unary confining factor `exp(-V(η))` (e.g. a harmonic trap `V(η) = ‖η‖²/2`).
+"""
 struct ConfineLik{F} <: Likelihood
     V :: F   # confining potential V(η)
 end
@@ -79,6 +115,14 @@ log_dens(c::ConfineLik, η, y) = -c.V(η)
 #Used in the sparse linear model (Seeger 2008), where the non-Gaussian
 #sites are prior factors on the coefficients. Log-concave, which is what
 #keeps EP numerically stable here.
+"""
+    LaplaceLik(λ)
+
+Laplace (double-exponential) prior factor, normalized:
+`log_dens(LaplaceLik(λ), η, y) = log(λ/2) - λ*abs(η)`. Used in the sparse
+linear model (`sparse_lm`), where the non-Gaussian sites are prior factors
+on the coefficients.
+"""
 struct LaplaceLik <: Likelihood
     λ :: Float64
 end
@@ -92,6 +136,15 @@ log_dens(l::LaplaceLik, η, y) = log(l.λ/2) - l.λ*abs(η)
 #rule for this likelihood (see moments.jl) that handles the spike mass
 #exactly. (The field is named w, not π, so that `2π` elsewhere in a scope
 #where w is bound still means 2*Base.π.)
+"""
+    SpikeSlabLik(w, τ2)
+
+Spike-and-slab prior factor `f(η) = w δ(η) + (1-w) N(η; 0, τ2)`: a point mass
+at 0 (the spike, probability `w`) plus a Gaussian slab of variance `τ2`.
+The factor has no density w.r.t. Lebesgue measure, so `log_dens` is only the
+continuous (slab) part — EP never calls it, because `tilted_moments` has an
+analytic rule for this likelihood that handles the spike mass exactly.
+"""
 struct SpikeSlabLik <: Likelihood
     w :: Float64    # spike probability
     τ2 :: Float64   # slab variance

@@ -1,5 +1,12 @@
 abstract type AbstractSites end
 
+"""
+    GLMSites(X, y, lik[, qr])
+
+Legacy GLM site bundle: design matrix `X` (p×n), observations `y`,
+likelihood `lik` and quadrature rule `qr`, used by the `ep_glm` /
+`GLMApprox` path.
+"""
 struct GLMSites{TX,TY,L <: Likelihood} <: AbstractSites
     X :: Matrix{TX}
     y :: Vector{TY}

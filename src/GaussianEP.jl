@@ -10,6 +10,7 @@ include("sites.jl")
 include("gaussian_posterior.jl")
 include("model.jl")
 include("moments.jl")
+include("state.jl")
 include("ep.jl")
 include("interface.jl")
 

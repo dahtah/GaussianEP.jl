@@ -82,7 +82,7 @@ function fitted(G :: GLMApprox,i)
 end
 
 function fitted(G :: GLMApprox)
-    C.X'*G.μ
+    G.X'*G.μ
 end
 
 function cavity(G :: GLMApprox, i)
@@ -97,6 +97,12 @@ function cavity(G :: GLMApprox, i)
     (μ=μ,σ2=sc)
 end
 
+"""
+    se(G::GLMApprox)
+
+Standard errors of the posterior mean: `sqrt.(diag(Σ))` (legacy `GLMApprox`
+path).
+"""
 function se(G :: GLMApprox)
     sqrt.(diag(G.Σ))
 end

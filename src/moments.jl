@@ -10,14 +10,31 @@
 
 # generic fallback: tensor Gauss-Hermite quadrature, rank d ≤ 3.
 # power=α implements fractional EP: moments of f^α instead of f.
+# The rank is dispatched on Val(length(m)) so that each path infers
+# concretely (a runtime `d == 1` branch would leak the d>1 path's abstract
+# `log_dens(lik::Likelihood, η::Vector, y)` call into the rank-1 return type).
 # TODO: Gauss-Hermite does poorly on non-differentiable likelihoods (hard
 # spheres, |η| kinks): add a robust-but-slower rule (adaptive grid /
 # trapezoid on a truncated range) as an option. For hard-sphere factors in
 # d=1 the tilted integrals are exact in closed form via erf — add an
 # analytic rule for that case instead of quadrature.
+"""
+    tilted_moments(lik, y, m, S, qr; stein=false, power=1.0)
+
+Tilted moments of the factor `f(η) = exp(log_dens(lik, η, y))` against the
+Gaussian cavity `η ~ N(m, S)`: returns `(z, lz, μ, Σ)` with
+`z = E[f(η)]`, `lz = log z`, `μ = E[f(η)η]/z` and `Σ` the tilted covariance.
+Dispatches on the likelihood: analytic rules where available (Gaussian,
+Ising, spike-and-slab), log-space Gauss–Hermite quadrature otherwise
+(rank 1, or tensor rule for rank ≤ 3). `stein=true` uses Stein's lemma +
+autodiff for rank 1; `power=α` gives moments of `f^α` (fractional EP).
+"""
 function tilted_moments(lik::Likelihood, y, m::AbstractVector, S::AbstractMatrix, qr::QuadRule; stein::Bool=false, power::Float64=1.0)
-    d = length(m)
-    d == 1 && return _tilted_moments_1d(lik, y, m[1], S[1,1], qr, stein, power)
+    _tilted_quad(Val(length(m)), lik, y, m, S, qr, stein, power)
+end
+_tilted_quad(::Val{1}, lik, y, m::AbstractVector, S::AbstractMatrix, qr::QuadRule, stein::Bool, power::Float64) =
+    _tilted_moments_1d(lik, y, m[1], S[1,1], qr, stein, power)
+function _tilted_quad(::Val{d}, lik, y, m::AbstractVector, S::AbstractMatrix, qr::QuadRule, stein::Bool, power::Float64) where {d}
     d <= 3 || throw(ArgumentError("tensor quadrature supports rank ≤ 3, got rank $d; provide an analytic moment rule for this likelihood"))
     L = cholesky(Symmetric(S)).L
     k = length(qr.x)
@@ -37,6 +54,12 @@ function tilted_moments(lik::Likelihood, y, m::AbstractVector, S::AbstractMatrix
         return (z=0.0, lz=-Inf, μ=copy(m), Σ=Symmetric(S))
     end
     a = exp.(lw .- lz)
+    if maximum(a) >= 1 - 1e-12
+        # degenerate quadrature: a single node carries all the weight — no
+        # information; return the cavity moments (=> dQ = dr = 0) instead of a
+        # near-zero tilted covariance (pois_stability.md §5a)
+        return (z=exp(lz), lz=lz, μ=copy(m), Σ=Symmetric(S))
+    end
     μ = zeros(d)
     for n in 1:npts
         μ .+= a[n] * ηs[n]
@@ -49,31 +72,57 @@ function tilted_moments(lik::Likelihood, y, m::AbstractVector, S::AbstractMatrix
     (z=exp(lz), lz=lz, μ=μ, Σ=Symmetric(Σ))
 end
 
-# rank-1 quadrature, direct moments or via Stein's lemma
-function _tilted_moments_1d(lik::Likelihood, y, m1::Real, s2::Real, qr::QuadRule, stein::Bool, power::Float64)
-    xq = sqrt(s2) .* qr.x .+ m1
-    lw = [power*log_dens(lik, xq[j], y) + log(qr.w[j]) for j in eachindex(xq)]
-    lz = logsumexp(lw)
+# rank-1 quadrature, direct moments or via Stein's lemma.
+# The return type is annotated: the stein branch calls ForwardDiff.derivative,
+# whose declared return type is abstract even though the scalar API returns
+# Float64 at runtime — without the annotation the Any leaks into site_update.
+function _tilted_moments_1d(lik::Likelihood, y, m1::Real, s2::Real, qr::QuadRule, stein::Bool, power::Float64)::NamedTuple{(:z, :lz, :μ, :Σ), Tuple{Float64, Float64, Vector{Float64}, Matrix{Float64}}}
+    # two passes over the quadrature nodes, no intermediate arrays
+    sq = sqrt(s2)
+    lz = -Inf
+    @inbounds for j in eachindex(qr.x)
+        lw = power*log_dens(lik, sq*qr.x[j] + m1, y) + qr.logw[j]
+        lz = logaddexp(lz, lw)
+    end
     if !isfinite(lz)
         # all nodes have zero weight (e.g. cavity entirely inside a hard core):
         # no information — fall back to the cavity moments
         return (z=0.0, lz=-Inf, μ=[m1], Σ=reshape([s2], 1, 1))
     end
-    a = exp.(lw .- lz)
     if stein
         # Stein's lemma: E[f η] = m Z + s² E[f'],  E[f η²] = (m²+s²) Z + 2m s² E[f'] + s⁴ E[f''],
         # with f' = f (log f)' and f'' = f ((log f)'' + ((log f)')²), all on the same nodes
-        g1 = [power*ForwardDiff.derivative(η -> log_dens(lik, η, y), x) for x in xq]
-        g2 = [power*ForwardDiff.derivative(η -> ForwardDiff.derivative(ξ -> log_dens(lik, ξ, y), η), x) for x in xq]
-        Efg = dot(a, g1)                    # E[f (log f)'] / Z
-        Efgg = dot(a, g2 .+ g1.^2)          # E[f''] / Z
+        Efg = 0.0; Efgg = 0.0
+        @inbounds for j in eachindex(qr.x)
+            x = sq*qr.x[j] + m1
+            a = exp(power*log_dens(lik, x, y) + qr.logw[j] - lz)
+            g1 = power*ForwardDiff.derivative(η -> log_dens(lik, η, y), x)
+            g2 = power*ForwardDiff.derivative(η -> ForwardDiff.derivative(ξ -> log_dens(lik, ξ, y), η), x)
+            Efg += a*g1
+            Efgg += a*(g2 + g1^2)
+        end
         μ = m1 + s2*Efg
-        σ2 = (m1^2 + s2) + 2*m1*s2*Efg + s2^2*Efgg - μ^2
-        σ2 = max(σ2, 1e-12)
+        σ2raw = (m1^2 + s2) + 2*m1*s2*Efg + s2^2*Efgg - μ^2
     else
-        μ = dot(a, xq)
-        σ2 = max(dot(a, (xq .- μ).^2), 1e-12)
+        μ = 0.0; m2 = 0.0
+        @inbounds for j in eachindex(qr.x)
+            x = sq*qr.x[j] + m1
+            a = exp(power*log_dens(lik, x, y) + qr.logw[j] - lz)
+            μ += a*x
+            m2 += a*x*x
+        end
+        σ2raw = m2 - μ^2
     end
+    if !(σ2raw > 1e-11)
+        # degenerate quadrature: a single node carries (essentially) all the
+        # weight, so the raw tilted variance underflows. The quadrature then
+        # carries NO information about the factor — return the CAVITY moments
+        # (=> site update dQ = dr = 0) instead of letting the variance floor
+        # produce σ2 = 1e-12, i.e. site precision Qp = 1e12, which poisons Q
+        # (pois_stability.md §5a; status.md open question 8).
+        return (z=exp(lz), lz=lz, μ=[m1], Σ=reshape([s2], 1, 1))
+    end
+    σ2 = max(σ2raw, 1e-12)   # last-resort floor for a genuine tiny variance
     (z=exp(lz), lz=lz, μ=[μ], Σ=reshape([σ2], 1, 1))
 end
 
