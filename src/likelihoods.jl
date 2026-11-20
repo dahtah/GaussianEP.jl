@@ -1,6 +1,12 @@
 #basic idea of Likelihood type stolen from GaussianProcesses.jl
 abstract type Likelihood end
 
+# standard-normal cdf/pdf in log form, built on SpecialFunctions (erfc/erfcx)
+_normcdf(x) = 0.5 * erfc(-x / sqrt(2))
+_normlogcdf(x) = x < 0 ? log(0.5) + log(erfcx(-x / sqrt(2))) - 0.5 * x^2 :
+                          log(0.5 * erfc(-x / sqrt(2)))
+_normlogpdf(x) = -0.5 * x^2 - 0.5 * log(2π)
+
 #for debugging purposes, Gaussian likelihood with variance 1.
 struct GLik <: Likelihood
 end
@@ -38,6 +44,37 @@ end
 function log_dens(poisson::PoisLik, f, y)
     return y*f - exp(f) - lgamma(1.0 + y)
 end
+
+#Bernoulli outcome with probit link: log_dens = log Φ(η) for y true, log Φ(-η)
+#otherwise. Tilted moments are analytic (see moments.jl), so quadrature is
+#only used for fractional EP (power ≠ 1).
+"""
+    ProbitLik()
+
+Bernoulli likelihood with probit link: `log_dens(ProbitLik(), η, y)` is
+`log Φ(η)` for `y` true and `log Φ(-η)` otherwise. Tilted moments are
+analytic for `power == 1` (closed forms in `src/moments.jl`).
+"""
+struct ProbitLik <: Likelihood
+end
+
+log_dens(::ProbitLik, f, y) = y ? _normlogcdf(f) : _normlogcdf(-f)
+
+#Hard constraint |η| ≤ R in d = 1 (indicator of the hard sphere / interval).
+#Tilted moments are analytic (truncated normal, see moments.jl).
+"""
+    HardSphere(R)
+
+Hard constraint `|η| ≤ R` in d = 1 (indicator of the interval `[-R, R]`).
+`log_dens(HardSphere(R), η, y)` is `0` inside and `-Inf` outside. Tilted
+moments are analytic (truncated-normal closed forms via `erf`,
+`src/moments.jl`), so quadrature is never called on this likelihood.
+"""
+struct HardSphere <: Likelihood
+    R :: Float64
+end
+
+log_dens(h::HardSphere, η, y) = abs(η) <= h.R ? 0.0 : -Inf
 
 #allow anonymous function as inverse link
 struct BernLik{F} <: Likelihood

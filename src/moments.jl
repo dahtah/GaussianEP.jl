@@ -147,6 +147,55 @@ function tilted_moments(::IsingLik, y, m::AbstractVector, S::AbstractMatrix, qr:
     (z=exp(lz), lz=lz, μ=[t], Σ=reshape([σ2], 1, 1))
 end
 
+# analytic: probit Bernoulli likelihood f(η) = Φ(cη) with c = ±1, rank 1,
+# power = 1 (for power ≠ 1, Φ(cη)^α has no closed form — fall back to
+# quadrature). For η ~ N(m, s²), with γ = c·m/√(1+s²):
+#   Z       = E[f]   = Φ(γ)
+#   E[η f]  = m Φ(γ) + c s² φ(γ)/√(1+s²)
+#   E[η² f] = (m²+s²) Φ(γ) + c m s² (2+s²) φ(γ)/(1+s²)^{3/2}
+# (Stein's lemma twice, using E[φ(cη)] = φ(γ)/√(1+s²) and
+#  E[η φ(cη)] = m φ(γ)/(1+s²)^{3/2}).
+function tilted_moments(l::ProbitLik, y, m::AbstractVector, S::AbstractMatrix, qr::QuadRule; stein::Bool=false, power::Float64=1.0)
+    length(m) == 1 || throw(ArgumentError("ProbitLik sites are rank 1, got rank $(length(m))"))
+    power == 1.0 || return _tilted_moments_1d(l, y, m[1], S[1, 1], qr, stein, power)
+    m1 = m[1]; s2 = S[1, 1]
+    c = y ? 1.0 : -1.0
+    γ = c * m1 / sqrt(1 + s2)
+    Φγ = _normcdf(γ)
+    if !(Φγ > 0)   # cavity far in the tail: no information — cavity moments
+        return (z=0.0, lz=-Inf, μ=[m1], Σ=reshape([s2], 1, 1))
+    end
+    φγ = exp(_normlogpdf(γ))
+    lz = _normlogcdf(γ)
+    E1 = m1 * Φγ + c * s2 * φγ / sqrt(1 + s2)
+    E2 = (m1^2 + s2) * Φγ + c * m1 * s2 * (2 + s2) * φγ / (1 + s2)^1.5
+    μ = E1 / Φγ
+    σ2 = max(E2 / Φγ - μ^2, 1e-14)
+    (z=Φγ, lz=lz, μ=[μ], Σ=reshape([σ2], 1, 1))
+end
+
+# analytic: hard sphere |η| ≤ R, rank 1 (indicator^α = indicator for α > 0).
+# Truncated normal on [-R, R]: with a = (-R-m)/s, b = (R-m)/s, Z = Φ(b)-Φ(a):
+#   E[η]  = m + s (φ(a) - φ(b))/Z
+#   Var   = s² (1 + (a φ(a) - b φ(b))/Z - ((φ(a)-φ(b))/Z)²)
+function tilted_moments(h::HardSphere, y, m::AbstractVector, S::AbstractMatrix, qr::QuadRule; stein::Bool=false, power::Float64=1.0)
+    length(m) == 1 || throw(ArgumentError("HardSphere sites are rank 1, got rank $(length(m))"))
+    m1 = m[1]; s2 = S[1, 1]
+    s = sqrt(s2); R = h.R
+    a = (-R - m1) / s
+    b = (R - m1) / s
+    Z = _normcdf(b) - _normcdf(a)
+    if !(Z > 0)   # cavity entirely outside the sphere: no information
+        return (z=0.0, lz=-Inf, μ=[m1], Σ=reshape([s2], 1, 1))
+    end
+    φa = exp(_normlogpdf(a)); φb = exp(_normlogpdf(b))
+    lz = log(Z)
+    μ = m1 + s * (φa - φb) / Z
+    σ2 = s2 * (1 + (a * φa - b * φb) / Z - ((φa - φb) / Z)^2)
+    σ2 = max(σ2, 1e-14)
+    (z=Z, lz=lz, μ=[μ], Σ=reshape([σ2], 1, 1))
+end
+
 # analytic: spike-and-slab prior π δ(η) + (1-π) N(η; 0, τ²), rank 1.
 # Against a cavity N(m, s²) the tilted measure is a mixture: the spike
 # contributes mass π φ(m; 0, s²) at η = 0, the slab contributes
@@ -179,4 +228,46 @@ function tilted_moments(::GaussLik, y::AbstractVector, m::AbstractVector, S::Abs
     C = S + I/α
     lz = -.5*α*d*log(2π) + .5*d*log(2π/α) - .5*(y-m)'*(C\(y-m)) - .5*(d*log(2π) + logdet(Symmetric(C)))
     (z=exp(lz), lz=lz, μ=μ, Σ=Σ)
+end
+
+"""
+    adaptive_trap_moments_1d(lik, y, m, s2; L=8.0, N0=101, Nmax=12801, tol=1e-10)
+
+Tilted moments of a rank-1 factor by successive trapezoid refinement:
+compute with `trap_rule(L, N)` for `N = N0, 2N0-1, 4N0-3, ...` until the
+`(lz, μ, σ²)` triple changes by less than `tol` (or `Nmax` is reached).
+Robust "integration mode" for non-smooth or bounded factors where
+Gauss–Hermite under-resolves the tilted density (status.md: numerical
+stability of moment computation; open question 7).
+"""
+function adaptive_trap_moments_1d(lik::Likelihood, y, m::Real, s2::Real;
+                                  L::Real=8.0, N0::Int=101, Nmax::Int=12801, tol::Float64=1e-10)
+    prev = nothing
+    N = N0
+    while true
+        tm = _tilted_moments_1d(lik, y, m, s2, trap_rule(L, N), false, 1.0)
+        if prev !== nothing
+            d = max(abs(tm.lz - prev.lz), abs(tm.μ[1] - prev.μ[1]), abs(tm.Σ[1,1] - prev.Σ[1,1]))
+            d < tol && return tm
+        end
+        prev = tm
+        N >= Nmax && return tm
+        N = min(2*N - 1, Nmax)
+    end
+end
+
+"""
+    moment_disagreement(lik, y, m, s2, qr::QuadRule; L=8.0, N=801)
+
+Diagnostic: max abs difference between the Gauss–Hermite tilted moments
+(rule `qr`) and trapezoid-rule moments of the same tilted density. A large
+value flags a cavity where GH under-resolves the factor (strongly
+informative, kinked or bounded sites) — the detector suggested in
+status.md ("numerical stability of moment computation").
+"""
+function moment_disagreement(lik::Likelihood, y, m::Real, s2::Real, qr::QuadRule;
+                             L::Real=8.0, N::Int=801)
+    a = _tilted_moments_1d(lik, y, m, s2, qr, false, 1.0)
+    b = _tilted_moments_1d(lik, y, m, s2, trap_rule(L, N), false, 1.0)
+    max(abs(a.lz - b.lz), abs(a.μ[1] - b.μ[1]), abs(a.Σ[1,1] - b.Σ[1,1]))
 end
