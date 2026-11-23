@@ -70,12 +70,15 @@ function _small_pd_inv(S::Symmetric)
 end
 
 # --- interface: marginal and cavity ---
+# NB: method parameters are typed (`A::AM where AM<:AbstractMatrix`, ...) so the
+# bodies infer concretely — an `::AbstractMatrix` parameter makes every BLAS
+# call inside dispatch dynamically (perf_gap.md §3).
 
-marginal(st::DenseState, A::AbstractMatrix) = (A * st.μ, Symmetric(A * st.Σ * A'))
+marginal(st::DenseState, A::AM) where AM<:AbstractMatrix = (A * st.μ, Symmetric(A * st.Σ * A'))
 
 # cavity moments of η = A x with a fraction `power` of the site (Qi, ri) removed:
 #   Λc = S⁻¹ - t·Qi ,  λc = S⁻¹m - t·ri ,  shrink t until Λc is PD
-function cavity(st::DenseState, A::AbstractMatrix, Qi::AbstractMatrix, ri::AbstractVector, power::Float64=1.0)
+function cavity(st::DenseState, A::AM, Qi::QM, ri::RV, power::Float64=1.0) where {AM<:AbstractMatrix, QM<:AbstractMatrix, RV<:AbstractVector}
     S = Symmetric(A * st.Σ * A')
     m = A * st.μ
     Si = _small_pd_inv(S)
@@ -86,6 +89,7 @@ function cavity(st::DenseState, A::AbstractMatrix, Qi::AbstractMatrix, ri::Abstr
     t_min = λmaxQi > 0 ? 0.99 * minimum(eigvals(Si)) / λmaxQi : 0.0
     t = power
     Λc = Symmetric(Si - t*QiS)
+    t_min = max(t_min, 0.0)          # terminate even if S was not PD (t_min < 0)
     while !isposdef(Λc) && t > t_min
         t /= 2
         Λc = Symmetric(Si - t*QiS)
@@ -97,12 +101,19 @@ end
 
 # scalar (rank-1) cavity: a is a p-vector, qi/ri the scalar site params.
 # Same math as the matrix cavity above, without any small-matrix overhead.
-function cavity(st::DenseState, a::AbstractVector, qi::Real, ri::Real, power::Float64=1.0)
+function cavity(st::DenseState, a::AV, qi::Real, ri::Real, power::Float64=1.0) where AV<:AbstractVector
     Sa = st.Σ * a
     s = dot(a, Sa)
     m = dot(a, st.μ)
+    if !(s > 0) || !isfinite(s)      # Σ not PD in direction a: resync once
+        sync!(st)
+        Sa = st.Σ * a
+        s = dot(a, Sa)
+        m = dot(a, st.μ)
+        !(s > 0) && (s = 1e-12)      # last resort: huge cavity variance
+    end
     Si = 1 / s
-    t_min = qi > 0 ? 0.99 * Si / qi : 0.0
+    t_min = qi > 0 ? max(0.99 * Si / qi, 0.0) : 0.0
     t = power
     Λc = Si - t * qi
     while Λc <= 0 && t > t_min
@@ -119,7 +130,7 @@ end
 # Q += A'δQ A  ⟹  Σ -= ΣA' δQ (I + AΣA'δQ)⁻¹ AΣ ,  logdet Q += logdet(I + AΣA'δQ)
 # (determinant lemma — exact when Σ = Q⁻¹, approximate under Woodbury drift, which
 # is why sync! exists). PD backtracking: halve (δQ, δr) until K = I + AΣA'δQ is PD.
-function apply_site!(st::DenseState, A::AbstractMatrix, δQ::AbstractMatrix, δr::AbstractVector; rmax::Float64=1e12)
+function apply_site!(st::DenseState, A::AM, δQ::DQM, δr::DRV; rmax::Float64=1e12) where {AM<:AbstractMatrix, DQM<:AbstractMatrix, DRV<:AbstractVector}
     SA = st.Σ * A'                       # p×d
     SAA = A * SA                         # d×d
     δQ = copy(δQ); δr = copy(δr)
@@ -142,18 +153,30 @@ function apply_site!(st::DenseState, A::AbstractMatrix, δQ::AbstractMatrix, δr
     st.r .+= A' * δr
     st.logdetQ += LinearAlgebra.logdet(Matrix(K))   # determinant lemma; K is d×d and PD here
     st.Σ .-= SA * (δQ / K) * SA'
-    st.Σ .= Symmetric(st.Σ)
+    # NB: no `st.Σ .= Symmetric(st.Σ)` here — the Woodbury update above is
+    # symmetric up to roundoff (SA*(δQ/K)*SA' is a symmetric product), and the
+    # full p² copy cost ~20 KB and ~5 µs per site update in the EP hot loop
+    # (perf_gap.md §3); sync! every `resync` cycles controls the drift.
     st.μ .= st.Σ * st.r
     return (δQ, δr)                      # the applied change
 end
 
 # rank-1 fast path (GLM sites, A = a'): scalar cavity arithmetic + BLAS.ger!,
 # same math as the generic path with d=1 but without forming d×d matrices
-function apply_site!(st::DenseState, a::AbstractVector, δq::Real, δr::Real; rmax::Float64=1e12)
+function apply_site!(st::DenseState, a::AV, δq::Real, δr::Real; rmax::Float64=1e12) where AV<:AbstractVector
+    Sa = st.Σ * a
+    apply_site!(st, a, δq, δr, Sa, dot(a, Sa); rmax=rmax)
+end
+
+# rank-1 apply with the matvec Sa = Σa and s = a'Σa precomputed (shared with
+# the cavity computation in the fused hot path — saves one O(p²) matvec per
+# site, perf_gap.md §7.3)
+function apply_site!(st::DenseState, a::AV, δq::Real, δr::Real, Sa::Vector{Float64}, s::Float64; rmax::Float64=1e12) where AV<:AbstractVector
     isfinite(δq) || (δq = 0.0)
     isfinite(δr) || (δr = 0.0)
-    Sa = st.Σ * a
-    s = dot(a, Sa)
+    if !(s > 0) || !isfinite(s)
+        return nothing               # cannot validate PD-ness of the update
+    end
     K = 1 + s*δq
     while (K <= 0 || abs(δr) > rmax) && (abs(δq) > 1e-14 || abs(δr) > rmax)
         δq /= 2
@@ -161,18 +184,31 @@ function apply_site!(st::DenseState, a::AbstractVector, δq::Real, δr::Real; rm
         K = 1 + s*δq
     end
     (K > 0 && abs(δr) <= rmax) || return nothing
+    rSa = dot(Sa, st.r)                  # a'Σr = a'μ, needed for the O(p) μ update
     BLAS.ger!(δq, a, a, st.Q)            # Q += δq a a'
     st.r .+= δr .* a
     st.logdetQ += log(K)
-    BLAS.ger!(-δq/K, Sa, Sa, st.Σ)       # Σ -= (δq/K) (Σa)(Σa)'
-    st.Σ .= Symmetric(st.Σ)
-    st.μ .= st.Σ * st.r
+    c = δq / K
+    BLAS.ger!(-c, Sa, Sa, st.Σ)          # Σ -= (δq/K) (Σa)(Σa)'
+    # O(p) incremental μ update instead of the O(p²) matvec μ = Σr
+    # (algebraically identical: μ⁺ = (Σ - c Sa Sa')(r + δr a)
+    #  = μ + (δr - c(Sa'r + δr s)) Sa — same formula as legacy update_approx!,
+    #  perf_gap.md §3). ger! keeps Σ exactly symmetric, so no Symmetric copy.
+    st.μ .+= (δr - c*(rSa + δr*s)) .* Sa
     return (δq, δr)
 end
 
 # --- interface: resync from Q (Woodbury drift control) ---
 function sync!(st::DenseState)
-    C = cholesky(Symmetric(st.Q))
+    C = try
+        cholesky(Symmetric(st.Q))
+    catch
+        # Q drifted non-PD between syncs (extreme site precisions): project
+        # onto the PSD cone and continue instead of throwing
+        F = eigen(Symmetric(st.Q))
+        st.Q .= Symmetric(F.vectors * Diagonal(clamp.(F.values, 1e-12, Inf)) * F.vectors')
+        cholesky(Symmetric(st.Q))
+    end
     st.Σ .= inv(Symmetric(st.Q))
     st.μ .= st.Σ * st.r
     st.logdetQ = 2 * sum(log, diag(C.L))

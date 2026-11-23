@@ -22,12 +22,16 @@ prob = φ.(X'*w_true) #prob of observing a 1
 y = rand(n) .<= prob #observations ("labels")
 ```
 
-Then we can run GaussianEP:
+Then we can run GaussianEP. Build the model with `glm_model` and run EP on it with `ep`:
 ```{julia}
-G = ep_glm(X,y,Logit())
+M = glm_model(X, y, Logit())   # GLM: prior N(0, τ⁻¹I) with τ = 0.01 (default), one site per observation
+G = ep(M; qr=QuadRule(20))     # run expectation propagation (qr = quadrature rule for the site moments)
 mean(G) #Approx posterior mean
-cov(G) #Approx posterior covariance
+cov(G)  #Approx posterior covariance
+log_ml(G) #EP estimate of the (log) marginal likelihood
 ```
+
+The legacy entry point `ep_glm(X, y, Logit())` fits the same model on the original GLM code path and returns an equivalent approximation.
 
 ## Details
 
@@ -35,19 +39,20 @@ cov(G) #Approx posterior covariance
 
 The default prior over the weights is a zero-mean Gaussian with covariance $\mathbf{I}\tau^{-1}$. $\tau$ is a prior precision and can be set:
 ```{julia}
-G = ep_glm(X,y,Logit(),τ=10.)
+M = glm_model(X, y, Logit(), 10.0) # τ = 10
+G = ep(M)
 ```
 The (log) marginal likelihood is also approximated and can be extracted via:
 ```{julia}
 log_ml(G)
 ```
-This allows for hyperparameter selection on τ. 
+This allows for hyperparameter selection on τ — either by scanning a grid with `glm_regpath(X, y, Logit(), τ0, τ1)` (a regularisation path over τ, warm-started along the path) or directly with `glm_autotune(X, y, Logit(), τ0, τ1)`, which returns `(τ_opt, G, path)` with `G` refitted at the τ maximising the EP log marginal likelihood.
 
 ### Likelihoods 
 
-The likelihood is set via the third argument of ep_glm: 
+The likelihood is set via the third argument of `glm_model`: 
 ```{julia}
-G = ep_glm(X,y,PoisLik()) #switch to Poisson lik. with mean exp(η)
+G = ep(glm_model(X, y, PoisLik())) #switch to Poisson lik. with mean exp(η)
 ```
 
 It is possible to define your own custom likelihood function. For instance, here we define a likelihood that is logistic for some observations and Poisson for others: 
@@ -65,7 +70,7 @@ end
 #Here we make it a vector of tuples (type,value)
 y = [(type=i,value=rand() > .5) for _ in 1:10 for i in 1:2]
 X = randn(2,length(y))
-G = ep_glm(X,y,MixedLik(Logit(),PoisLik()))
+G = ep(glm_model(X, y, MixedLik(Logit(),PoisLik())))
 ```
 
 ## Author

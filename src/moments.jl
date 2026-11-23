@@ -77,6 +77,13 @@ end
 # whose declared return type is abstract even though the scalar API returns
 # Float64 at runtime — without the annotation the Any leaks into site_update.
 function _tilted_moments_1d(lik::Likelihood, y, m1::Real, s2::Real, qr::QuadRule, stein::Bool, power::Float64)::NamedTuple{(:z, :lz, :μ, :Σ), Tuple{Float64, Float64, Vector{Float64}, Matrix{Float64}}}
+    lz, μ, σ2 = _tm1_scalar(lik, y, m1, s2, qr, stein, power)
+    (z=exp(lz), lz=lz, μ=[μ], Σ=reshape([σ2], 1, 1))
+end
+
+# scalar core of the rank-1 quadrature: returns (lz, μ, σ2) with no small
+# arrays — this is the EP hot path (perf_gap.md §7.1)
+function _tm1_scalar(lik::Likelihood, y, m1::Real, s2::Real, qr::QuadRule, stein::Bool, power::Float64)
     # two passes over the quadrature nodes, no intermediate arrays
     sq = sqrt(s2)
     lz = -Inf
@@ -87,7 +94,7 @@ function _tilted_moments_1d(lik::Likelihood, y, m1::Real, s2::Real, qr::QuadRule
     if !isfinite(lz)
         # all nodes have zero weight (e.g. cavity entirely inside a hard core):
         # no information — fall back to the cavity moments
-        return (z=0.0, lz=-Inf, μ=[m1], Σ=reshape([s2], 1, 1))
+        return (-Inf, m1, s2)
     end
     if stein
         # Stein's lemma: E[f η] = m Z + s² E[f'],  E[f η²] = (m²+s²) Z + 2m s² E[f'] + s⁴ E[f''],
@@ -120,11 +127,85 @@ function _tilted_moments_1d(lik::Likelihood, y, m1::Real, s2::Real, qr::QuadRule
         # (=> site update dQ = dr = 0) instead of letting the variance floor
         # produce σ2 = 1e-12, i.e. site precision Qp = 1e12, which poisons Q
         # (pois_stability.md §5a; status.md open question 8).
-        return (z=exp(lz), lz=lz, μ=[m1], Σ=reshape([s2], 1, 1))
+        return (lz, m1, s2)
     end
     σ2 = max(σ2raw, 1e-12)   # last-resort floor for a genuine tiny variance
-    (z=exp(lz), lz=lz, μ=[μ], Σ=reshape([σ2], 1, 1))
+    (lz, μ, σ2)
 end
+
+# --- scalar analytic tilted moments for rank-1 sites ---
+# Each returns (lz, μ, σ2) or `nothing` (→ quadrature fallback). Mirrors the
+# vector rules above but without any small-matrix allocation (hot path).
+function _tm1_analytic(::GLik, y::Real, m1::Real, s2::Real, power::Float64)
+    α = power
+    Λ = 1/s2 + α
+    μ = (m1/s2 + α*y)/Λ
+    σ2 = 1/Λ
+    lz = -.5*α*log(2π) + .5*log(2π/α) - .5*(y-m1)^2/(s2+1/α) - .5*log(2π*(s2+1/α))
+    (lz, μ, σ2)
+end
+_tm1_analytic(::GaussLik, y::AbstractVector, m1::Real, s2::Real, power::Float64) =
+    length(y) == 1 ? _tm1_analytic(GLik(), y[1], m1, s2, power) : nothing
+
+function _tm1_analytic(::IsingLik, y, m1::Real, s2::Real, power::Float64)
+    t = tanh(m1/s2)
+    σ2 = max(1 - t^2, 1e-12)
+    lz = -.5*(1+m1^2)/s2 + log(2*cosh(m1/s2)) - .5*log(2π*s2)
+    (lz, t, σ2)
+end
+
+function _tm1_analytic(l::ProbitLik, y, m1::Real, s2::Real, power::Float64)
+    power == 1.0 || return nothing
+    c = y ? 1.0 : -1.0
+    γ = c * m1 / sqrt(1 + s2)
+    Φγ = _normcdf(γ)
+    !(Φγ > 0) && return (-Inf, m1, s2)   # cavity far in the tail: no information
+    φγ = exp(_normlogpdf(γ))
+    lz = _normlogcdf(γ)
+    E1 = m1 * Φγ + c * s2 * φγ / sqrt(1 + s2)
+    E2 = (m1^2 + s2) * Φγ + c * m1 * s2 * (2 + s2) * φγ / (1 + s2)^1.5
+    μ = E1 / Φγ
+    σ2 = max(E2 / Φγ - μ^2, 1e-14)
+    (lz, μ, σ2)
+end
+
+function _tm1_analytic(h::HardSphere, y, m1::Real, s2::Real, power::Float64)
+    s = sqrt(s2); R = h.R
+    a = (-R - m1) / s
+    b = (R - m1) / s
+    Z = _normcdf(b) - _normcdf(a)
+    !(Z > 0) && return (-Inf, m1, s2)     # cavity entirely outside the sphere
+    φa = exp(_normlogpdf(a)); φb = exp(_normlogpdf(b))
+    lz = log(Z)
+    μ = m1 + s * (φa - φb) / Z
+    σ2 = max(s2 * (1 + (a * φa - b * φb) / Z - ((φa - φb) / Z)^2), 1e-14)
+    (lz, μ, σ2)
+end
+
+function _tm1_analytic(l::SpikeSlabLik, y, m1::Real, s2::Real, power::Float64)
+    α = power
+    τ2 = l.τ2/α
+    lspike = log(l.w) - .5*(m1^2/s2 + log(2π*s2))
+    lslab = log1p(-l.w) - .5*(m1^2/(s2+τ2) + log(2π*(s2+τ2)))
+    lz = logaddexp(lspike, lslab)
+    a = exp(lslab - lz)                     # slab weight in the tilted measure
+    μs = m1*τ2/(τ2+s2)
+    vs = τ2*s2/(τ2+s2)
+    μ = a*μs
+    σ2 = max(a*(μs^2 + vs) - μ^2, 1e-14)
+    (lz, μ, σ2)
+end
+
+_tm1_analytic(lik, y, m1, s2, power) = nothing   # → quadrature fallback
+
+# scalar dispatcher mirroring `tilted_moments` for rank-1 sites:
+# analytic rule when available, quadrature core otherwise. Returns (lz, μ, σ2).
+function _tilted_moments_scalar(lik::Likelihood, y, m1::Real, s2::Real, qr::QuadRule, stein::Bool, power::Float64)
+    a = _tm1_analytic(lik, y, m1, s2, power)
+    a !== nothing && return a
+    _tm1_scalar(lik, y, m1, s2, qr, stein, power)
+end
+
 
 # analytic: Gaussian likelihood N(y; η, 1), rank 1. power=α gives moments of f^α.
 function tilted_moments(::GLik, y::Real, m::AbstractVector, S::AbstractMatrix, qr::QuadRule; stein::Bool=false, power::Float64=1.0)

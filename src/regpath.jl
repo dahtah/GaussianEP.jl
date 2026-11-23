@@ -2,6 +2,9 @@
 # glm_model(X, y, lik, τ) has Q0 = τ·I, so τ rescales the base measure; each
 # point of the path is fitted with `ep`, warm-started from the previous
 # point's site parameters (rebuild! recomputes the state from Q0 + sites).
+# The path runs from the high-τ end (τ1) down to τ0: at high τ the sites are
+# weak and the posterior is close to the prior, which makes the first fit
+# stable (status.md TODO "start with high τ").
 
 """
     rebuild!(G::EPApprox)
@@ -29,10 +32,16 @@ end
 
 Regularisation path over the prior precision τ ∈ [τ0, τ1] (log-spaced,
 `nsteps` points) for a GLM `glm_model(X, y, lik, τ)` on the new EP core.
-Each point is fitted with `ep`, warm-started from the previous point's site
-parameters. Returns a named tuple:
+The path is traversed **from the high-τ end (τ1) down to τ0**, so the
+returned `τs` are in decreasing order; each point is fitted with `ep`,
+warm-started from the previous point's site parameters. Starting at high τ
+(strong prior, weakly informative sites, posterior ≈ prior) gives the most
+stable first fit, and the continuation then tracks the posterior as the
+prior is relaxed.
 
-- `τs` — the grid,
+Returns a named tuple:
+
+- `τs` — the grid, in **decreasing** order (τ1 first, τ0 last),
 - `μs` — p×nsteps matrix of posterior means, `sds` — marginal posterior sds,
 - `logml` — EP log marginal likelihood per point (for hyperparameter
   selection),
@@ -42,7 +51,7 @@ parameters. Returns a named tuple:
 function glm_regpath(X, y, lik, τ0, τ1; nsteps=10, qr=QuadRule(20), maxcycles=50,
                      tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false,
                      power::Float64=1.0)
-    τs = exp.(range(log(τ0), log(τ1), nsteps))
+    τs = exp.(range(log(τ1), log(τ0), nsteps))   # high-τ end first (see docstring)
     p = size(X, 1)
     μs = zeros(p, nsteps)
     sds = zeros(p, nsteps)
@@ -74,9 +83,10 @@ end
     glm_autotune(X, y, lik, τ0, τ1; nsteps=10, kwargs...)
 
 Empirical-Bayes selection of the prior precision τ for a GLM on the new EP
-core: runs `glm_regpath` over [τ0, τ1] and refits at the τ maximising the EP
-log marginal likelihood. Returns `(τ_opt, G, path)` with `G` the fitted
-`EPApprox` at `τ_opt` and `path` the full `glm_regpath` result.
+core: runs `glm_regpath` over [τ0, τ1] (traversed from τ1 down to τ0) and
+refits at the τ maximising the EP log marginal likelihood. Returns
+`(τ_opt, G, path)` with `G` the fitted `EPApprox` at `τ_opt` and `path` the
+full `glm_regpath` result (its `τs` in decreasing order).
 """
 function glm_autotune(X, y, lik, τ0, τ1; nsteps=10, kwargs...)
     path = glm_regpath(X, y, lik, τ0, τ1; nsteps=nsteps, kwargs...)
@@ -85,3 +95,46 @@ function glm_autotune(X, y, lik, τ0, τ1; nsteps=10, kwargs...)
     G = ep(glm_model(X, y, lik, τ_opt); kwargs...)
     (τ_opt=τ_opt, G=G, path=path)
 end
+
+# ---------------------------------------------------------------------------
+# Pretty-printing: compact summaries instead of dumping the raw arrays.
+# The results of glm_regpath / glm_autotune are plain named tuples, so we
+# specialise show on their exact key sets.
+# ---------------------------------------------------------------------------
+
+# compact rendering of a vector of numbers (truncate long grids)
+function _compact_nums(v::AbstractVector; maxn::Int=6)
+    r = round.(v, sigdigits=4)
+    s = join(string.(r), ", ")
+    length(v) > maxn && (s = join(string.(r[1:maxn]), ", ") * ", ...")
+    return s
+end
+
+"""
+    show(io, path)  # result of `glm_regpath`
+
+Compact summary of a regularisation path: number of τ grid points, the τ
+grid, the log marginal likelihood per point, and the best τ (max logml).
+"""
+function Base.show(io::IO, path::NamedTuple{(:τs, :μs, :sds, :logml, :μavg, :sdavg)})
+    k = argmax(path.logml)
+    print(io, "GLM regpath over tau: $(length(path.τs)) points in [$(minimum(path.τs)), $(maximum(path.τs))]")
+    print(io, "\n  tau grid: ", _compact_nums(path.τs))
+    print(io, "\n  logml:    ", _compact_nums(path.logml))
+    print(io, "\n  best tau = $(path.τs[k]) with logml = $(path.logml[k])")
+    return nothing
+end
+Base.show(io::IO, ::MIME"text/plain", path::NamedTuple{(:τs, :μs, :sds, :logml, :μavg, :sdavg)}) = show(io, path)
+
+"""
+    show(io, at)  # result of `glm_autotune`
+
+Compact summary of an autotune result: the selected `τ_opt`, the log marginal
+likelihood at the optimum, and the size of the underlying τ path.
+"""
+function Base.show(io::IO, at::NamedTuple{(:τ_opt, :G, :path)})
+    print(io, "GLM autotune: tau_opt = $(at.τ_opt), logml at tau_opt = $(maximum(at.path.logml)) ",
+          "(max over a $(length(at.path.τs))-point tau path)")
+    return nothing
+end
+Base.show(io::IO, ::MIME"text/plain", at::NamedTuple{(:τ_opt, :G, :path)}) = show(io, at)

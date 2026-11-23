@@ -47,7 +47,9 @@ function GLMApprox(S :: GLMSites,τ=.01)
         h[i] = max(0.0,qi-1)
     end
     Q=Q0 + S.X*Diagonal(h)*S.X'
-    Σ=inv(Q)
+    #Σ = Q⁻¹ via Cholesky (Q is symmetric PD: Q0 = τI, h ≥ 0)
+    C = cholesky(Symmetric(Q))
+    Σ = C \ Matrix{Float64}(I,m,m)
     μ=Σ*S.X*r
 
     logz=zeros(n)
@@ -109,7 +111,8 @@ end
 
 #for debugging
 function check_consistency(G :: GLMApprox)
-    @assert G.Σ ≈ inv(G.Q)
+    C = cholesky(Symmetric(G.Q))
+    @assert G.Σ ≈ C \ Matrix{Float64}(I,size(G.Q))
     @assert G.μ ≈ G.Σ*G.X*G.r
 end
 
@@ -155,7 +158,9 @@ function set_tau!(G :: GLMApprox,τ)
     m = dim(G)
     G.Q0 .= τ*Matrix(I,m,m)
     G.Q .= G.Q0 + G.X*Diagonal(G.h)*G.X'
-    G.Σ .= inv(G.Q)
+    #Σ = Q⁻¹ and μ = Σ X r via a Cholesky factorisation of Q (no explicit inv)
+    C = cholesky(Symmetric(G.Q))
+    G.Σ .= C \ Matrix{Float64}(I,m,m)
     G.μ .= G.Σ*G.X*G.r
 end
 
@@ -185,7 +190,9 @@ function _approx_fit!(G :: GLMApprox,S :: GLMSites;α=.1,maxcycles=24,tol=.001)
         G.h .= (1-α)*G.h+α*(dq)
         G.r .= (1-α)*G.r+α*(dr)
         G.Q .= G.Q0 + G.X*Diagonal(G.h)*G.X'
-        G.Σ .= inv(G.Q)
+        #Σ = Q⁻¹ and μ = Σ X r via a Cholesky factorisation of Q (no explicit inv)
+        C = cholesky(Symmetric(G.Q))
+        G.Σ .= C \ Matrix{Float64}(I,dim(G),dim(G))
         G.μ .= G.Σ*G.X*G.r
         delta = mean(abs.(m-G.h))
         @info "δ = $(delta)"
@@ -194,6 +201,13 @@ function _approx_fit!(G :: GLMApprox,S :: GLMSites;α=.1,maxcycles=24,tol=.001)
     end
 end
 
+"""
+    fit!(G::GLMApprox, S::GLMSites, maxcycles=24, tol=.001)
+
+Run (sequential) expectation propagation on the legacy `GLMApprox` in place
+until the mean changes by less than `tol` between cycles (or `maxcycles`),
+and return `G`. Used by [`ep_glm`](@ref).
+"""
 function fit!(G :: GLMApprox,S :: GLMSites,maxcycles=24,tol=.001)
     m = mean(G)
     for c in 1:maxcycles
@@ -210,6 +224,13 @@ Increase prior precision, or increase number of quadrature nodes"
     return 
 end
 
+"""
+    log_ml(G::GLMApprox)
+
+EP estimate of the log marginal likelihood of the GLM (legacy `GLMApprox`
+path): `log Z(Q, Xr) - log Z(Q0, 0) + Σᵢ logzᵢ`, with `Q = Q0 + X diag(h) X'`
+computed via a Cholesky factorisation of `Q`.
+"""
 function log_ml(G :: GLMApprox)
     log_partition(Symmetric(G.Q),G.X*G.r)-log_partition(Symmetric(G.Q0),zeros(dim(G))) + sum(G.logz)
 end

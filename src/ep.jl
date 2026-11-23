@@ -13,12 +13,14 @@ EP approximation of an `EPModel`: natural parameters `Q = Q0 + Σᵢ Aᵢ'QᵢA�
 `Σ = Q⁻¹`, `μ = Σr` held in `G.state` (an `AbstractEPState`, `DenseState` for
 a full `Q`). Constructed empty; run `fit!` (or `ep`) to converge.
 """
-struct EPApprox{T,M<:EPModel}
+mutable struct EPApprox{T,M<:EPModel}
     model :: M
     state :: AbstractEPState
     Qi :: Vector{Matrix{T}}
     ri :: Vector{Vector{T}}
     logz :: Vector{T}
+    logZ0 :: T    # log partition of the base measure, cached at construction
+    lastδ :: T    # final convergence residual of the last fit! call
 end
 
 # compat: G.Q, G.Σ, G.μ, G.r forward to the state (read-only use)
@@ -31,6 +33,12 @@ end
 
 Statistics.mean(G::EPApprox) = mean(G.state)
 Statistics.cov(G::EPApprox) = cov(G.state)
+"""
+    se(G::EPApprox)
+
+Standard errors of the posterior mean: `sqrt.(diag(cov(G)))` (new-core
+`EPApprox` path).
+"""
 se(G::EPApprox) = sqrt.(diag(cov(G)))
 dim(G::EPApprox) = dim(G.state)
 nsites(G::EPApprox) = nsites(G.model)
@@ -105,7 +113,8 @@ function EPApprox(M::EPModel; qr=QuadRule(20), T=Float64, stein::Bool=false, pow
         end
     end
     sync!(st)
-    EPApprox{T,typeof(M)}(M, st, Qi, ri, zeros(T, n))
+    logZ0 = T(safe_log_partition(Matrix(M.Q0), M.r0))   # cached: log_ml is O(p) (perf_gap.md §7.4)
+    EPApprox{T,typeof(M)}(M, st, Qi, ri, zeros(T, n), logZ0, T(Inf))
 end
 
 # cavity parameters of η_i = A_i x, in moment form — delegated to the state
@@ -131,14 +140,30 @@ end
 # scalar log ∫ exp(-.5 q η² + r η) dη  (rank-1 safe_log_partition)
 _logpart1(q::Real, r::Real) = 0.5*(log(2π) - log(q) + r^2/q)
 
-# rank-1 fast path: scalar cavity arithmetic, no small-matrix allocations
-function _site_update_1d(G::EPApprox, i, qr::QuadRule, stein::Bool, power::Float64)
+# likelihoods with an analytic tilted-moment rule (never need quadrature,
+# so the GH-vs-trap disagreement check does not apply to them)
+_has_analytic_rule(::GLik, power) = true
+_has_analytic_rule(::IsingLik, power) = true
+_has_analytic_rule(::SpikeSlabLik, power) = true
+_has_analytic_rule(::GaussLik, power) = true
+_has_analytic_rule(::HardSphere, power) = true
+_has_analytic_rule(::ProbitLik, power) = power == 1.0
+_has_analytic_rule(lik, power) = false
+
+# rank-1 fast path: scalar cavity arithmetic, no small-matrix allocations.
+# robust=true: if the GH rule and the trapezoid rule disagree on the tilted
+# moments by more than robust_tol (under-resolved cavity: kinked/bounded/
+# strongly informative factor), recompute with the trapezoid rule.
+function _site_update_1d(G::EPApprox, i, qr::QuadRule, stein::Bool, power::Float64, robust::Bool, robust_tol::Float64)
     s = G.model.sites[i]
     cv = cavity(G, i, power)
     m1 = cv.m[1]; s2 = cv.S[1, 1]
     # NB: go through the tilted_moments dispatcher so analytic rules
     # (GLik, IsingLik, SpikeSlabLik, GaussLik) are used when available
     z, lzt, μt, Σt = tilted_moments(s.lik, s.y, [m1], [s2;;], qr, stein=stein, power=power)
+    if robust && !_has_analytic_rule(s.lik, power) && moment_disagreement(s.lik, s.y, m1, s2, qr) > robust_tol
+        z, lzt, μt, Σt = tilted_moments(s.lik, s.y, [m1], [s2;;], trap_rule(8.0, 3201), stein=stein, power=power)
+    end
     Qp = 1 / Σt[1, 1]; rp = Qp * μt[1]
     Λc = 1 / s2; λc = Λc * m1
     dQ = [Qp - Λc;;]; dr = [rp - λc]
@@ -155,9 +180,68 @@ function _site_update_1d(G::EPApprox, i, qr::QuadRule, stein::Bool, power::Float
     (dQ=dQ, dr=dr, lz=lz)
 end
 
-function site_update(G::EPApprox, i, qr::QuadRule; stein::Bool=false, power::Float64=1.0)
+# Fused rank-1 site update + apply (hot path, power == 1): scalar cavity
+# inline, ONE Σ*a matvec shared between cavity and apply, scalar tilted
+# moments, no small-matrix allocations (perf_gap.md §7.1/§7.3).
+# Returns the proposed site-param change max(|dQ-Qi|, |dr-ri|) for the
+# convergence check.
+function _site_update_apply_1d!(G::EPApprox, i, qr::QuadRule, stein::Bool, damp::Float64, robust::Bool, robust_tol::Float64)
+    s = G.model.sites[i]
+    a = @view(s.A[1, :])
+    st = G.state
+    Sa = st.Σ * a
+    sa2 = dot(a, Sa)                 # cavity marginal variance s = a'Σa
+    ma = dot(a, st.μ)                # cavity mean m = a'μ
+    if !(sa2 > 0) || !isfinite(sa2)
+        # Σ lost PD-ness in direction a (Woodbury drift): resync from Q once,
+        # skip the site if still bad — never enter the cavity loop with Si ≤ 0
+        # (t_min would be negative and the halving loop would not terminate)
+        sync!(st)
+        Sa = st.Σ * a
+        sa2 = dot(a, Sa)
+        ma = dot(a, st.μ)
+        if !(sa2 > 0) || !isfinite(sa2)
+            G.logz[i] = 0.0
+            return 0.0
+        end
+    end
+    qi = G.Qi[i][1, 1]; ri = G.ri[i][1]
+    Si = 1 / sa2
+    t_min = qi > 0 ? max(0.99 * Si / qi, 0.0) : 0.0
+    t = 1.0
+    Λc = Si - qi                     # power = 1: remove the full site
+    while Λc <= 0 && t > t_min
+        t /= 2
+        Λc = Si - t * qi
+    end
+    λc = Si * ma - t * ri
+    s2 = 1 / Λc
+    m1 = s2 * λc
+    lzt, μt, σ2t = _tilted_moments_scalar(s.lik, s.y, m1, s2, qr, stein, 1.0)
+    if robust && !_has_analytic_rule(s.lik, 1.0) && moment_disagreement(s.lik, s.y, m1, s2, qr) > robust_tol
+        lzt, μt, σ2t = _tilted_moments_scalar(s.lik, s.y, m1, s2, trap_rule(8.0, 3201), stein, 1.0)
+    end
+    Qp = 1 / σ2t; rp = Qp * μt
+    dq = Qp - Λc; dr = rp - λc
+    lz = lzt + _logpart1(Λc, λc) - _logpart1(Qp, rp)
+    isfinite(lz) || (lz = 0.0)
+    δq = damp * (dq - qi)
+    δr = damp * (dr - ri)
+    applied = apply_site!(st, a, δq, δr, Sa, sa2)
+    if applied === nothing
+        G.logz[i] = lz
+        return max(abs(dq - qi), abs(dr - ri))
+    end
+    δqa, δra = applied
+    G.Qi[i][1, 1] += δqa
+    G.ri[i][1] += δra
+    G.logz[i] = lz
+    return max(abs(dq - qi), abs(dr - ri))
+end
+
+function site_update(G::EPApprox, i, qr::QuadRule; stein::Bool=false, power::Float64=1.0, robust::Bool=false, robust_tol::Float64=1e-6)
     if size(G.model.sites[i].A, 1) == 1
-        return _site_update_1d(G, i, qr, stein, power)
+        return _site_update_1d(G, i, qr, stein, power, robust, robust_tol)
     end
     s = G.model.sites[i]
     cv = cavity(G, i, power)
@@ -226,7 +310,22 @@ function update_site!(G::EPApprox, i, dQ, dr, lz, α=1.0, power::Float64=1.0)
     return
 end
 
-function fit!(G::EPApprox; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10)
+"""
+    fit!(G::EPApprox; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0,
+         stein=false, parallel=false, power=1.0, resync=10, robust=false,
+         robust_tol=1e-6)
+
+Run expectation propagation on `G` in place until convergence (or
+`maxcycles`), and return `G`. Same keyword semantics as [`ep`](@ref):
+`damp` ∈ (0,1] damps the site updates, `parallel=true` uses damped Jacobi
+(parallel) updates, `stein=true` uses Stein/autodiff moments for rank-1
+sites, `power=α` is fractional EP (target unchanged), `resync` is how often
+(in cycles) the state is resynced from `Q` (Woodbury drift), `robust=true`
+auto-switches a site to the trapezoid rule when `moment_disagreement` flags
+its cavity. Convergence is measured on both the mean and the site natural
+parameters.
+"""
+function fit!(G::EPApprox; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:strict)
     m = copy(mean(G))
     δ = Inf
     n = nsites(G)
@@ -241,7 +340,7 @@ function fit!(G::EPApprox; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, st
             # (embarrassingly parallel), then applied with damping
             ups = Vector{NamedTuple{(:dQ, :dr, :lz)}}(undef, n)
             Threads.@threads for i in 1:n
-                ups[i] = site_update(G, i, qr, stein=stein, power=power)
+                ups[i] = site_update(G, i, qr, stein=stein, power=power, robust=robust, robust_tol=robust_tol)
             end
             for i in 1:n
                 δsite = max(δsite, maximum(abs.(ups[i].dQ .- power .* G.Qi[i])), maximum(abs.(ups[i].dr .- power .* G.ri[i])))
@@ -249,35 +348,57 @@ function fit!(G::EPApprox; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, st
             end
         else
             for i in 1:n
-                dQ, dr, lz = site_update(G, i, qr, stein=stein, power=power)
-                δsite = max(δsite, maximum(abs.(dQ .- power .* G.Qi[i])), maximum(abs.(dr .- power .* G.ri[i])))
-                update_site!(G, i, dQ, dr, lz, damp, power)
+                if size(G.model.sites[i].A, 1) == 1 && power == 1.0
+                    # fused scalar hot path (perf_gap.md §7)
+                    δsite = max(δsite, _site_update_apply_1d!(G, i, qr, stein, damp, robust, robust_tol))
+                else
+                    dQ, dr, lz = site_update(G, i, qr, stein=stein, power=power, robust=robust, robust_tol=robust_tol)
+                    δsite = max(δsite, maximum(abs.(dQ .- power .* G.Qi[i])), maximum(abs.(dr .- power .* G.ri[i])))
+                    update_site!(G, i, dQ, dr, lz, damp, power)
+                end
             end
         end
-        # convergence on both the mean and the site natural parameters
-        # (the mean alone can be stationary in symmetric models)
-        δ = max(maximum(abs.(mean(G) .- m)), δsite)
+        # convergence criterion: :strict = max|Δμ| AND max site-param change
+        # (the mean alone can be stationary in symmetric models — default);
+        # :max = max|Δμ| only; :mean = mean|Δμ| (legacy ep_glm criterion,
+        # matches legacy cycle counts exactly — perf_gap.md §1)
+        dμ = mean(G) .- m
+        δ = if crit === :mean
+            mean(abs.(dμ))
+        elseif crit === :max
+            maximum(abs.(dμ))
+        else
+            max(maximum(abs.(dμ)), δsite)
+        end
         δ < tol && break
         m .= mean(G)
     end
     sync!(G.state)
+    G.lastδ = δ
     δ < tol || @info "EP did not reach tolerance (δ=$δ); consider damping or more quadrature nodes"
     return G
 end
 
 """
     ep(M::EPModel; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0,
-       stein=false, parallel=false, power=1.0, resync=10)
+       stein=false, parallel=false, power=1.0, resync=10, robust=false,
+       robust_tol=1e-6, crit=:strict)
 
 Run expectation propagation on `M` until convergence and return the
 `EPApprox`. `damp` ∈ (0,1] damps the site updates, `parallel=true` uses
 damped Jacobi (parallel) updates, `stein=true` uses Stein/autodiff moments
 for rank-1 sites, `power=α` is fractional EP (target unchanged), `resync`
 is how often (in cycles) the state is resynced from `Q` (Woodbury drift).
+`robust=true` re-computes rank-1 tilted moments with the trapezoid rule
+(`trap_rule`) whenever `moment_disagreement` against `qr` exceeds
+`robust_tol` — the robust integration mode for kinked/bounded factors
+(status.md; `test/quadrature.jl`). `crit` selects the convergence criterion:
+`:strict` (default) = max|Δμ| and max site-param change, `:max` = max|Δμ|,
+`:mean` = mean|Δμ| (the legacy `ep_glm` criterion, perf_gap.md §1).
 """
-function ep(M::EPModel; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10)
+function ep(M::EPModel; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:strict)
     G = EPApprox(M, qr=qr, stein=stein, power=power)
-    fit!(G, qr=qr, maxcycles=maxcycles, tol=tol, damp=damp, stein=stein, parallel=parallel, power=power, resync=resync)
+    fit!(G, qr=qr, maxcycles=maxcycles, tol=tol, damp=damp, stein=stein, parallel=parallel, power=power, resync=resync, robust=robust, robust_tol=robust_tol, crit=crit)
 end
 
 """
@@ -291,6 +412,5 @@ O(p) thanks to the online state bookkeeping: `logZ(Q, r)` uses the maintained
 `logdet Q` and `r'Σr = r'μ` instead of fresh O(p³) factorizations.
 """
 function log_ml(G::EPApprox)
-    M = G.model
-    logZ(G.state) - safe_log_partition(Matrix(M.Q0), M.r0) + sum(G.logz)
+    logZ(G.state) - G.logZ0 + sum(G.logz)
 end

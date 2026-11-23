@@ -25,8 +25,11 @@ struct Logit <: Likelihood
 end
 
 #Link function - move to struct
-logistic = (x)->1/(1+exp(-x))
-loglogistic = (x)->-log1pexp(-x)
+# NB: `const` so that log_dens(Logit, ...) infers Float64 — a non-const global
+# makes every call box (return type Any), which dominates the quadrature loops
+# in the EP hot path (perf_gap.md §3).
+const logistic = (x)->1/(1+exp(-x))
+const loglogistic = (x)->-log1pexp(-x)
 function log_dens(t::Logit, f, y)
     return y ? loglogistic(f) : loglogistic(-f)
 end

@@ -108,3 +108,23 @@ end
     @test maximum(abs.(cov(G1))) < 1e-8
     @test abs(log_ml(G1) - ex1.log_ml) < 1e-6
 end
+
+@testset "non-PD drift: cavity loop terminates, sync! robust (regression)" begin
+    # exact model that used to hang the cavity halving loop (Si < 0 after
+    # Woodbury drift => t_min < 0 => no termination) and then threw in sync!
+    rng = MersenneTwister(42)
+    p, n, k, snr = 50, 100, 3, 5.0
+    d = nothing
+    for r in 1:4
+        X = randn(rng, p, n)
+        S = randperm(rng, p)[1:k]
+        β = zeros(p); β[S] = randn(rng, k) .* 3.0
+        σ2 = Statistics.var(X' * β) / snr
+        y = X' * β .+ sqrt(σ2) .* randn(rng, n)
+        d = (X=X, y=y, σ2=σ2)
+    end
+    M = spike_slab_lm(d.X, d.y, 0.9, 100.0, d.σ2)
+    G = ep(M; qr=QuadRule(20), tol=1e-6, maxcycles=30)   # must terminate
+    @test isfinite(log_ml(G))
+    @test all(isfinite, mean(G))
+end

@@ -13,6 +13,7 @@ include("moments.jl")
 include("state.jl")
 include("ep.jl")
 include("regpath.jl")
+include("spikeslab.jl")
 include("interface.jl")
 
 export QuadRule, GLMSites, Logit, PoisLik, ep_glm,log_ml,se,
@@ -21,5 +22,6 @@ export QuadRule, GLMSites, Logit, PoisLik, ep_glm,log_ml,se,
        ProbitLik, HardSphere,
        glm_model, ising_model, gas_model, sparse_lm, spike_slab_lm,
        glm_regpath, glm_autotune,
-       trap_rule, adaptive_trap_moments_1d, moment_disagreement
+       trap_rule, adaptive_trap_moments_1d, moment_disagreement,
+       spike_slab_glm, inclusion_probs, support, slab_weight, spike_slab_autotune
 end

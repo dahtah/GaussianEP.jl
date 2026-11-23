@@ -134,3 +134,30 @@ end
     # GH(60) under-resolves the kink: visibly worse log_ml than the trap rule
     @test abs(log_ml(Gt) - lml_ref) < abs(log_ml(Gg) - lml_ref) / 10
 end
+
+@testset "robust=true auto-switches to trapezoid on flagged cavities" begin
+    # Laplace (kinked) sites: GH(20) under-resolves, robust mode should fix it
+    m = 4
+    τ = 1.0
+    λ = 2.0
+    lik = LaplaceLik(λ)
+    M = EPModel(τ*Matrix(I,m,m), [Site(_row(i,m), 0.0, lik) for i in 1:m])
+    Gg = ep(M, qr=QuadRule(20))                    # plain GH
+    Gr = ep(M, qr=QuadRule(20), robust=true)       # auto-switch when flagged
+    lml_ref = 0.0
+    for i in 1:m
+        ref = qref_moments(η -> GaussianEP.log_dens(lik, η, 0.0), 0.0, 1/τ)
+        @test abs(mean(Gr)[i] - ref.μ) < 1e-5
+        @test abs(cov(Gr)[i,i] - ref.σ2) < 1e-4
+        lml_ref += log(ref.z)
+    end
+    @test abs(log_ml(Gr) - lml_ref) < 1e-4
+    # robust mode must be at least as accurate as plain GH here
+    @test abs(log_ml(Gr) - lml_ref) <= abs(log_ml(Gg) - lml_ref) + 1e-12
+    # smooth sites: robust mode never triggers, results identical
+    Mg = EPModel(τ*Matrix(I,m,m), [Site(_row(i,m), 1.0, GaussianEP.GLik()) for i in 1:m])
+    Ga = ep(Mg, qr=QuadRule(20))
+    Gb = ep(Mg, qr=QuadRule(20), robust=true)
+    @test mean(Ga) ≈ mean(Gb) atol=1e-12
+    @test log_ml(Ga) ≈ log_ml(Gb) atol=1e-12
+end

@@ -65,7 +65,9 @@ end
 function importance_sampling(G :: GLMApprox,S :: GLMSites,ns,γ=1.1)
     lw = zeros(ns)
     N = MultivariateNormal(mean(G),γ*Symmetric(cov(G)))
-    P = MultivariateNormal(zeros(dim(G)),Symmetric(inv(G.Q0)))
+    #prior covariance Q0⁻¹ via Cholesky (Q0 = τI is symmetric PD)
+    C0 = cholesky(Symmetric(G.Q0))
+    P = MultivariateNormal(zeros(dim(G)),Symmetric(C0 \ Matrix{Float64}(I,dim(G),dim(G))))
     z = rand(N,ns)
     for i in 1:ns
         lw[i] = loglik(S,z[:,i]) + logpdf(P,z[:,i]) - logpdf(N,z[:,i])

@@ -1,0 +1,19 @@
+name = "GaussianEPDocs"
+uuid = "8f3a2b1c-4d5e-4f6a-9b7c-1d2e3f4a5b6c"
+version = "0.1.0"
+
+[deps]
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+GaussianEP = "2d72bc77-855f-486f-9f10-bfd23a0f3fd5"
+KernelFunctions = "ec8451be-7e33-11e9-00cf-bbf324bd1392"
+Literate = "98b081ad-f1c9-55d3-8b20-4c87d4299306"
+
+[sources]
+GaussianEP = {path = "/home/barthesi/Repos/GaussianEP.jl"}
+
+[compat]
+CairoMakie = "0.15.17"
+Documenter = "1.20.0"
+KernelFunctions = "0.11.1"
+Literate = "2.21.1"
