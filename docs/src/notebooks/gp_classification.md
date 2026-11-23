@@ -39,14 +39,6 @@ using LinearAlgebra, Statistics, Random
 using CairoMakie
 ````
 
-````
-[ Info: Precompiling InterpolationsForwardDiffExt [aa714d75-9fb6-509f-aa9a-ed6a6428d03c] (caches not reused: 4 for different dependency version already loaded, 2 for different Julia build configuration)
-Precompiling packages...
-   0.6 s  ✓ Interpolations → InterpolationsForwardDiffExt
-  1 dependency successfully precompiled in 2 seconds. 45 already precompiled.
-
-````
-
 %% [markdown]
 ## 2. Toy dataset
 

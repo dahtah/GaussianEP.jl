@@ -18,6 +18,10 @@ const NOTEBOOKS_OUT = joinpath(DOCS_DIR, "src", "notebooks")  # docs/src/noteboo
 notebook_pages = String[]
 if isdir(NOTEBOOKS_IN)
     mkpath(NOTEBOOKS_OUT)
+    # drop stale generated pages (e.g. from a removed/renamed notebook)
+    for stale in readdir(NOTEBOOKS_OUT; join = true)
+        endswith(stale, ".md") && rm(stale; force = true)
+    end
     for file in sort(readdir(NOTEBOOKS_IN; join = true))
         if endswith(file, ".jl")
             out = Literate.markdown(file, NOTEBOOKS_OUT; documenter = true, execute = true)

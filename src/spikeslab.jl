@@ -19,7 +19,7 @@ function spike_slab_glm(X::AbstractMatrix, y, lik, w::Real, τ2::Real; τ0::Real
     p, n = size(X, 1), size(X, 2)
     0 ≤ w ≤ 1 || throw(ArgumentError("w must be in [0,1]"))
     τ2 > 0 || throw(ArgumentError("τ2 must be positive"))
-    sites = [Site(reshape(X[:, i], 1, p), y[i], lik) for i in 1:n]
+    sites = AbstractSite[Site(reshape(X[:, i], 1, p), y[i], lik) for i in 1:n]
     append!(sites, [Site(_unit_row(i, p), nothing, SpikeSlabLik(Float64(w), Float64(τ2))) for i in 1:p])
     EPModel(τ0*Matrix{Float64}(I, p, p), sites)
 end
@@ -89,5 +89,67 @@ function spike_slab_autotune(X::AbstractMatrix, y::AbstractVector;
         end
     end
     best === nothing && error("spike_slab_autotune: no grid point converged — try damping or a larger τ0")
+    (w=best.w, τ2=best.τ2, logml=best.logml, G=best.G, grid=grid)
+end
+
+# sup_η log_dens(lik, η, y) on a grid (the likelihoods used with GLMs are
+# unimodal in η; the grid is wide enough for standardized data)
+function _site_logdens_sup(lik, y; ngrid::Int=2001, L::Float64=40.0)
+    best = -Inf
+    for η in range(-L, L, ngrid)
+        v = log_dens(lik, η, y)
+        v > best && (best = v)
+    end
+    return best
+end
+
+"""
+    spike_slab_glm_autotune(X, y, lik; ws, τ2s, τ0=1e-8, kwargs...)
+
+Empirical-Bayes hyperparameter selection for the spike-and-slab GLM
+`spike_slab_glm(X, y, lik, w, τ2; τ0=τ0)`: fits `ep` on the grid `ws × τ2s`
+and returns the setting maximising the EP log marginal likelihood. Returns
+`(w, τ2, logml, G, grid)` with `G` the fitted `EPApprox` at the optimum and
+`grid` the full `(w, τ2, logml, converged)` list. `kwargs...` are passed to
+`ep`.
+
+Diverged fits are rejected, as in `spike_slab_autotune`: non-finite logml,
+final residual `G.lastδ ≥ 1e3`, a hard error (non-PD state), or an EP logml
+above the rigorous upper bound `Σᵢ sup_η log_dens(likᵢ, η, yᵢ)` (plus a small
+slack for the EP approximation error) — the bound holds because
+`log ∫ b ∏ fᵢ ≤ Σᵢ sup log fᵢ + log ∫ b`, and a spike site whose cavity
+collapses onto 0 produces exactly such astronomically large logml values.
+"""
+function spike_slab_glm_autotune(X::AbstractMatrix, y, lik;
+                                 ws=(0.5, 0.8, 0.9, 0.95), τ2s=(1.0, 10.0, 100.0),
+                                 τ0::Real=1e-8, kwargs...)
+    p, n = size(X, 1), size(X, 2)
+    # likelihood part of the logml upper bound (independent of w, τ2), with a
+    # slack for the EP logml approximation error
+    ub = 5.0 + 0.01 * (n + p)
+    for i in 1:n
+        ub += _site_logdens_sup(lik, y[i])
+    end
+    best = nothing
+    grid = NamedTuple{(:w, :τ2, :logml, :converged)}[]
+    for w in ws, τ2 in τ2s
+        M = spike_slab_glm(X, y, lik, w, τ2; τ0=τ0)
+        # prior sites add p · sup log_dens(SpikeSlabLik) = p·(log(1-w) − ½log(2πτ2))
+        ubw = ub + p * (log1p(-w) - 0.5 * log(2π * τ2))
+        G, lml, ok = try
+            G = ep(M; kwargs...)
+            lml = log_ml(G)
+            # reject diverged fits (huge residual / non-finite or impossible
+            # evidence): they would otherwise win the argmax with a garbage logml
+            (G, lml, isfinite(lml) && isfinite(G.lastδ) && G.lastδ < 1e3 && lml <= ubw)
+        catch
+            (nothing, NaN, false)   # hard divergence (non-PD state): reject
+        end
+        push!(grid, (w=w, τ2=τ2, logml=lml, converged=ok))
+        if ok && (best === nothing || lml > best.logml)
+            best = (w=w, τ2=τ2, logml=lml, G=G)
+        end
+    end
+    best === nothing && error("spike_slab_glm_autotune: no grid point converged — try damping or a larger τ0")
     (w=best.w, τ2=best.τ2, logml=best.logml, G=best.G, grid=grid)
 end

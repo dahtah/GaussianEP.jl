@@ -17,6 +17,13 @@
 #   mean(st), cov(st), logdet(st), quadform(st)   quadform = r'Σr = r'μ
 #   logZ(st)                              log ∫ exp(-.5 x'Qx + r'x) dx
 #
+# The state also carries `τ`, the scale of the base measure: the model's Q0 is
+# interpreted as the UNSCALED base and the effective prior precision matrix is
+# τ·Q0 (τ = 1 by default, so a model with Q0 already scaled is unaffected).
+# `set_tau!` (src/regpath.jl) changes τ in place — Q ← Q + (τ_new − τ_old)·Q0,
+# one refactorisation, no per-site loop — which is how glm_regpath traverses
+# the regularisation path without rebuilding the model or the EPApprox.
+#
 # DenseState implements the interface for a full (dense) Q via rank-d Woodbury
 # updates — the "Q is a full matrix" case. The constructor EPState(Q0, r0) is the
 # dispatch hook for the sparse case: today sparse/diagonal Q0 fall back to the
@@ -33,6 +40,7 @@ mutable struct DenseState{T} <: AbstractEPState
     μ :: Vector{T}
     r :: Vector{T}
     logdetQ :: T
+    τ :: T          # scale of the base measure: effective Q0 = τ·Q0 (default 1)
 end
 
 # --- constructor dispatch (the sparse-case hook) ---
@@ -55,7 +63,7 @@ function DenseState(Q0::AbstractMatrix, r0::AbstractVector)
     Σ = inv(Symmetric(Q))
     μ = Σ * r
     logdetQ = 2 * sum(log, diag(C.L))   # full logdet of Q
-    DenseState{Float64}(Q, Σ, μ, r, logdetQ)
+    DenseState{Float64}(Q, Σ, μ, r, logdetQ, 1.0)
 end
 
 # --- accessors ---
@@ -252,6 +260,7 @@ mutable struct CholeskyState{T} <: AbstractEPState
     r :: Vector{T}
     μ :: Vector{T}
     logdetQ :: T
+    τ :: T          # scale of the base measure: effective Q0 = τ·Q0 (default 1)
 end
 
 function CholeskyState(Q0::AbstractMatrix, r0::AbstractVector)
@@ -260,7 +269,7 @@ function CholeskyState(Q0::AbstractMatrix, r0::AbstractVector)
     C = cholesky(Symmetric(Q))
     μ = C \ r
     logdetQ = 2 * sum(log, diag(C.factors))
-    CholeskyState{Float64}(C, r, μ, logdetQ)
+    CholeskyState{Float64}(C, r, μ, logdetQ, 1.0)
 end
 
 # compat: G.Q / G.Σ forwarding (EPApprox getproperty calls getproperty on the

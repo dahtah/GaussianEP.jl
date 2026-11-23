@@ -1,43 +1,76 @@
 # Regularisation path over the prior precision τ for GLMs on the new EP core.
-# glm_model(X, y, lik, τ) has Q0 = τ·I, so τ rescales the base measure; each
-# point of the path is fitted with `ep`, warm-started from the previous
-# point's site parameters (rebuild! recomputes the state from Q0 + sites).
-# The path runs from the high-τ end (τ1) down to τ0: at high τ the sites are
-# weak and the posterior is close to the prior, which makes the first fit
-# stable (status.md TODO "start with high τ").
+# The model is built ONCE with the unscaled base measure (glm_model(X, y, lik, 1.0),
+# Q0 = I); the path scale τ lives in the state (st.τ, effective base = τ·Q0) and
+# is changed in place with set_tau! — Q ← Q + (τ_new − τ_old)·Q0 plus one
+# refactorisation, no per-site loop, no model/EPApprox reconstruction per grid
+# point. Site parameters Qi, ri are carried over between grid points (warm
+# start). The path runs from the high-τ end (τ1) down to τ0: at high τ the
+# sites are weak and the posterior is close to the prior, which makes the
+# first fit stable (status.md TODO "start with high τ").
 
 """
     rebuild!(G::EPApprox)
 
 Recompute the state (`Q, r, Σ, μ, logdetQ`) from the model's base measure
-`(Q0, r0)` and the current site parameters `Qi, ri`. Used to warm-start a
-fit across hyperparameter values (e.g. a change of prior precision τ).
+`(G.state.τ * Q0, r0)` and the current site parameters `Qi, ri`. Used to
+warm-start a fit across hyperparameter values (e.g. a change of prior
+precision τ).
 """
 function rebuild!(G::EPApprox)
     M = G.model
-    Q = Matrix{Float64}(M.Q0)
+    st = G.state
+    Q = st.τ .* Matrix{Float64}(M.Q0)
     r = Vector{Float64}(M.r0)
     for i in eachindex(M.sites)
         A = M.sites[i].A
         Q .+= A' * G.Qi[i] * A
         r .+= A' * G.ri[i]
     end
-    reset!(G.state, Q, r)     # backend-agnostic (DenseState / CholeskyState)
+    reset!(st, Q, r)          # backend-agnostic (DenseState / CholeskyState)
+    return G
+end
+
+"""
+    set_tau!(G::EPApprox, τ)
+
+Change the base-measure scale in place: the effective prior precision matrix
+goes from `G.state.τ · Q0` to `τ · Q0`. The state's `Q` (which already contains
+the site contributions `Σᵢ Aᵢ'QᵢAᵢ`) is updated as `Q ← Q + (τ − τ_old)·Q0` and
+refactorised once — `O(p²)` plus one `O(p³)` factorisation, no per-site loop —
+and the cached base-measure partition `G.logZ0` is recomputed, so `log_ml`
+stays correct. Site parameters `Qi, ri` are kept (warm start). The model's
+`Q0` is interpreted as the *unscaled* base measure; `G.state.τ` defaults to 1.
+"""
+function set_tau!(G::EPApprox, τ::Real)
+    st = G.state
+    τ == st.τ && return G
+    M = G.model
+    Q0 = Matrix{Float64}(M.Q0)
+    Q = st.Q .+ (τ - st.τ) .* Q0     # st.Q = st.τ·Q0 + Σ A'QiA  (st.Q materialises for CholeskyState)
+    reset!(st, Q, st.r)              # r = r0 + Σ A'ri is τ-independent
+    st.τ = τ
+    G.logZ0 = safe_log_partition(τ .* Q0, Vector{Float64}(M.r0))
     return G
 end
 
 """
     glm_regpath(X, y, lik, τ0, τ1; nsteps=10, qr=QuadRule(20), maxcycles=50,
-                tol=1e-8, damp=1.0, stein=false, parallel=false, power=1.0)
+                tol=1e-8, damp=1.0, stein=false, parallel=false, power=1.0,
+                backend=:dense)
 
 Regularisation path over the prior precision τ ∈ [τ0, τ1] (log-spaced,
 `nsteps` points) for a GLM `glm_model(X, y, lik, τ)` on the new EP core.
 The path is traversed **from the high-τ end (τ1) down to τ0**, so the
-returned `τs` are in decreasing order; each point is fitted with `ep`,
+returned `τs` are in decreasing order; each point is fitted with `fit!`,
 warm-started from the previous point's site parameters. Starting at high τ
 (strong prior, weakly informative sites, posterior ≈ prior) gives the most
 stable first fit, and the continuation then tracks the posterior as the
 prior is relaxed.
+
+Implementation: one model (unscaled base `Q0 = I`) and one mutable `EPApprox`
+are built for the whole path; the grid point τ is moved in place with
+`set_tau!` (`Q ← Q + (τ_new − τ_old)·Q0`, one refactorisation — no per-site
+loop, no reconstruction per grid point).
 
 Returns a named tuple:
 
@@ -50,27 +83,23 @@ Returns a named tuple:
 """
 function glm_regpath(X, y, lik, τ0, τ1; nsteps=10, qr=QuadRule(20), maxcycles=50,
                      tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false,
-                     power::Float64=1.0)
+                     power::Float64=1.0, backend::Symbol=:dense)
     τs = exp.(range(log(τ1), log(τ0), nsteps))   # high-τ end first (see docstring)
     p = size(X, 1)
     μs = zeros(p, nsteps)
     sds = zeros(p, nsteps)
     lml = zeros(nsteps)
-    Gprev = nothing
+    # one model (unscaled base Q0 = I) and one EPApprox for the whole path; τ is
+    # carried by the state and moved with set_tau!, site params warm-start
+    M = glm_model(X, y, lik, 1.0)
+    G = EPApprox(M; qr=qr, stein=stein, power=power, backend=backend)
     for (k, τ) in enumerate(τs)
-        M = glm_model(X, y, lik, τ)
-        G = EPApprox(M; qr=qr, stein=stein, power=power)
-        if Gprev !== nothing            # warm start from the previous point
-            G.Qi .= Gprev.Qi
-            G.ri .= Gprev.ri
-            rebuild!(G)
-        end
+        set_tau!(G, τ)
         fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, damp=damp, stein=stein,
              parallel=parallel, power=power)
         μs[:, k] .= mean(G)
         sds[:, k] .= se(G)
         lml[k] = log_ml(G)
-        Gprev = G
     end
     w = softmax(lml)                    # model weights ∝ exp(logml)
     μavg = μs * w

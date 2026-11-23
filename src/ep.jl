@@ -5,6 +5,15 @@
 # (src/state.jl): DenseState keeps a full Q and maintains Σ, μ, logdetQ by
 # rank-d Woodbury updates — no per-cycle re-inversion, online log_ml.
 
+# Preallocated workspace threaded through `fit!` and the fused rank-1 hot
+# path: the per-site `Sa = Σa` matvec result and the Δμ convergence buffer
+# are reused across sites and cycles, so the sequential hot path allocates
+# ~nothing per site (perf_alloc.md §3).
+mutable struct EPWorkspace{T}
+    Sa :: Vector{T}    # buffer for Sa = Σa (one matvec per site, shared cavity/apply)
+    dμ :: Vector{T}    # buffer for Δμ in the convergence check
+end
+
 """
     EPApprox(M::EPModel; qr=QuadRule(20), stein=false, power=1.0)
 
@@ -21,6 +30,7 @@ mutable struct EPApprox{T,M<:EPModel}
     logz :: Vector{T}
     logZ0 :: T    # log partition of the base measure, cached at construction
     lastδ :: T    # final convergence residual of the last fit! call
+    ws :: EPWorkspace{T}   # preallocated buffers for the fit! hot path (perf_alloc.md)
 end
 
 # compat: G.Q, G.Σ, G.μ, G.r forward to the state (read-only use)
@@ -86,35 +96,59 @@ function EPApprox(M::EPModel; qr=QuadRule(20), T=Float64, stein::Bool=false, pow
     st = EPState(M.Q0, M.r0; backend=backend)
     Qi = Vector{Matrix{T}}(undef, n)
     ri = Vector{Vector{T}}(undef, n)
-    for i in 1:n
+    # function barrier: inside _init_sites! the state is concretely typed
+    # (dispatch on the runtime type), so apply_site!/Σa are static and the
+    # per-site init does not box through the abstract AbstractEPState field
+    # (perf_alloc.md §3)
+    ws = EPWorkspace{T}(zeros(T, dim(st)), zeros(T, dim(st)))
+    _init_sites!(st, M, qr, stein, power, Qi, ri, ws, T)
+    sync!(st)
+    logZ0 = T(safe_log_partition(Matrix(M.Q0), M.r0))   # cached: log_ml is O(p) (perf_gap.md §7.4)
+    EPApprox{T,typeof(M)}(M, st, Qi, ri, zeros(T, n), logZ0, T(Inf), ws)
+end
+
+function _init_sites!(st::ST, M::EPModel, qr::QuadRule, stein::Bool, power::Float64, Qi, ri, ws::EPWorkspace, ::Type{T}) where {ST<:AbstractEPState, T}
+    for i in 1:nsites(M)
         s = M.sites[i]
         A = s.A
         d = size(A, 1)
-        S = Symmetric(Matrix{T}(I, d, d))   # fixed unit cavity ...
-        mv = zeros(T, d)                    # ... at m = 0
-        z, lzt, μt, Σt = tilted_moments(s.lik, s.y, mv, S, qr, stein=stein, power=power)
-        Λc = pd_inv(S)
-        λc = Λc * mv
-        Qp = pd_inv(Symmetric(Σt))
-        rp = Qp * μt
-        # site natural params are tilted minus cavity (absolute, not incremental)
-        Qi[i] = psd_project(Symmetric(Qp - Λc))
-        ri[i] = rp - λc
         if d == 1
-            applied = apply_site!(st, @view(A[1, :]), Qi[i][1, 1], ri[i][1])
+            # scalar init at the fixed unit cavity (m=0, S=I) — algebraically
+            # identical to the generic path below (Λc = pd_inv(I) = 1, λc = 0,
+            # Qp = pd_inv(Σt) = 1/clamp(σ2,1e-12,Inf), psd_project of the 1×1
+            # Qp-Λc = clamp(Qp-1, 0, Inf)) but without per-site small matrices
+            # and 1×1 eigen decompositions (perf_alloc.md §2)
+            _, μt, σ2t = _tilted_moments_scalar(s.lik, s.y, zero(T), one(T), qr, stein, power)
+            Qp = 1 / max(σ2t, 1e-12)
+            rp = Qp * μt
+            qi = max(Qp - 1, zero(T))
+            ri_i = rp
+            Qi[i] = fill(qi, 1, 1)
+            ri[i] = [ri_i]
+            a = @view(A[1, :])
+            Sa = _Σa_into!(ws.Sa, st, a)          # buffered matvec (perf_alloc.md §3)
+            applied = apply_site!(st, a, qi, ri_i, Sa, dot(a, Sa))
             if applied !== nothing             # backtracked init: keep what was applied
                 Qi[i][1, 1], ri[i][1] = applied
             end
         else
+            S = Symmetric(Matrix{T}(I, d, d))   # fixed unit cavity ...
+            mv = zeros(T, d)                    # ... at m = 0
+            z, lzt, μt, Σt = tilted_moments(s.lik, s.y, mv, S, qr, stein=stein, power=power)
+            Λc = pd_inv(S)
+            λc = Λc * mv
+            Qp = pd_inv(Symmetric(Σt))
+            rp = Qp * μt
+            # site natural params are tilted minus cavity (absolute, not incremental)
+            Qi[i] = psd_project(Symmetric(Qp - Λc))
+            ri[i] = rp - λc
             applied = apply_site!(st, A, Qi[i], ri[i])
             if applied !== nothing
                 Qi[i], ri[i] = applied
             end
         end
     end
-    sync!(st)
-    logZ0 = T(safe_log_partition(Matrix(M.Q0), M.r0))   # cached: log_ml is O(p) (perf_gap.md §7.4)
-    EPApprox{T,typeof(M)}(M, st, Qi, ri, zeros(T, n), logZ0, T(Inf))
+    return nothing
 end
 
 # cavity parameters of η_i = A_i x, in moment form — delegated to the state
@@ -180,16 +214,40 @@ function _site_update_1d(G::EPApprox, i, qr::QuadRule, stein::Bool, power::Float
     (dQ=dQ, dr=dr, lz=lz)
 end
 
+# Σa into a preallocated buffer (hot path): DenseState has an explicit Σ,
+# CholeskyState solves with the factor; the generic fallback copies Σa(st, a).
+# Returns the buffer.
+_Σa_into!(buf::Vector{Float64}, st::DenseState, a::AbstractVector) = mul!(buf, st.Σ, a)
+function _Σa_into!(buf::Vector{Float64}, st::CholeskyState, a::AbstractVector)
+    LinearAlgebra.ldiv!(buf, st.C, a)
+    return buf
+end
+_Σa_into!(buf::Vector{Float64}, st::AbstractEPState, a::AbstractVector) = copyto!(buf, Σa(st, a))
+
 # Fused rank-1 site update + apply (hot path, power == 1): scalar cavity
-# inline, ONE Σ*a matvec shared between cavity and apply, scalar tilted
-# moments, no small-matrix allocations (perf_gap.md §7.1/§7.3).
+# inline, ONE Σ*a matvec shared between cavity and apply (into the workspace
+# buffer G.ws.Sa), scalar tilted moments, no small-matrix allocations
+# (perf_gap.md §7.1/§7.3; perf_alloc.md §3). `a` is the site's row view, passed
+# in by fit! (precomputed once per fit! when all sites are rank-1).
 # Returns the proposed site-param change max(|dQ-Qi|, |dr-ri|) for the
 # convergence check.
-function _site_update_apply_1d!(G::EPApprox, i, qr::QuadRule, stein::Bool, damp::Float64, robust::Bool, robust_tol::Float64)
+function _site_update_apply_1d!(G::EPApprox, i, a::AV, qr::QuadRule, stein::Bool, damp::Float64, robust::Bool, robust_tol::Float64) where AV<:AbstractVector
+    # function barrier: G.state is abstractly typed (AbstractEPState field), so
+    # the body is dispatched on the concrete state type — inside _hot1d! every
+    # state access is statically typed and nothing boxes (perf_alloc.md §3)
+    _hot1d!(G, i, a, G.state, qr, stein, damp, robust, robust_tol)
+end
+
+# state-passing variant: when the caller already holds the state in a
+# concretely-typed local (fit! → _fit_impl! barrier), the call below is a
+# static dispatch and allocates nothing (perf_alloc.md §3)
+function _site_update_apply_1d!(G::EPApprox, i, a::AV, st::ST, qr::QuadRule, stein::Bool, damp::Float64, robust::Bool, robust_tol::Float64) where {AV<:AbstractVector, ST<:AbstractEPState}
+    _hot1d!(G, i, a, st, qr, stein, damp, robust, robust_tol)
+end
+
+function _hot1d!(G::EPApprox, i, a::AV, st::ST, qr::QuadRule, stein::Bool, damp::Float64, robust::Bool, robust_tol::Float64) where {AV<:AbstractVector, ST<:AbstractEPState}
     s = G.model.sites[i]
-    a = @view(s.A[1, :])
-    st = G.state
-    Sa = Σa(st, a)
+    Sa = _Σa_into!(G.ws.Sa, st, a)
     sa2 = dot(a, Sa)                 # cavity marginal variance s = a'Σa
     ma = dot(a, st.μ)                # cavity mean m = a'μ
     if !(sa2 > 0) || !isfinite(sa2)
@@ -197,7 +255,7 @@ function _site_update_apply_1d!(G::EPApprox, i, qr::QuadRule, stein::Bool, damp:
         # skip the site if still bad — never enter the cavity loop with Si ≤ 0
         # (t_min would be negative and the halving loop would not terminate)
         sync!(st)
-        Sa = Σa(st, a)
+        Sa = _Σa_into!(G.ws.Sa, st, a)
         sa2 = dot(a, Sa)
         ma = dot(a, st.μ)
         if !(sa2 > 0) || !isfinite(sa2)
@@ -326,14 +384,32 @@ its cavity. Convergence is measured on both the mean and the site natural
 parameters.
 """
 function fit!(G::EPApprox; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:strict)
-    m = copy(mean(G))
+    # function barrier on the concrete state type: ONE dynamic dispatch per
+    # fit! call instead of one per site — inside _fit_impl! the state local is
+    # statically typed, so the hot path allocates nothing per site
+    # (perf_alloc.md §3)
+    return _fit_impl!(G, G.state; qr=qr, maxcycles=maxcycles, tol=tol, damp=damp, stein=stein, parallel=parallel, power=power, resync=resync, robust=robust, robust_tol=robust_tol, crit=crit)
+end
+
+function _fit_impl!(G::EPApprox, st::ST; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:strict) where {ST<:AbstractEPState}
+    ws = G.ws
+    m = copy(st.μ)
     δ = Inf
     n = nsites(G)
+    # Precompute the site row views once per fit! when all sites are rank-1
+    # with a uniform A type (concrete eltype) — avoids a ~96 B view allocation
+    # per site per cycle in the hot path (perf_alloc.md §3). Falls back to
+    # per-site views otherwise.
+    avs = nothing
+    if all(s -> size(s.A, 1) == 1, G.model.sites)
+        cand = [view(s.A, 1, :) for s in G.model.sites]
+        isconcretetype(eltype(cand)) && (avs = cand)
+    end
     for c in 1:maxcycles
         # Woodbury updates drift: resync Σ = Q⁻¹, μ = Σr, logdetQ from Q every
         # `resync` cycles (and once at the end) instead of re-inverting every
         # cycle — the PD backtracking in apply_site! is only valid when Σ ≈ Q⁻¹
-        (c % resync == 0) && sync!(G.state)
+        (c % resync == 0) && sync!(st)
         δsite = 0.0
         if parallel
             # Jacobi-style: all site updates computed against the same state
@@ -349,8 +425,10 @@ function fit!(G::EPApprox; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, st
         else
             for i in 1:n
                 if size(G.model.sites[i].A, 1) == 1 && power == 1.0
-                    # fused scalar hot path (perf_gap.md §7)
-                    δsite = max(δsite, _site_update_apply_1d!(G, i, qr, stein, damp, robust, robust_tol))
+                    # fused scalar hot path (perf_gap.md §7; perf_alloc.md §3);
+                    # st is concretely typed here → static dispatch, 0 B/site
+                    a = avs === nothing ? @view(G.model.sites[i].A[1, :]) : avs[i]
+                    δsite = max(δsite, _site_update_apply_1d!(G, i, a, st, qr, stein, damp, robust, robust_tol))
                 else
                     dQ, dr, lz = site_update(G, i, qr, stein=stein, power=power, robust=robust, robust_tol=robust_tol)
                     δsite = max(δsite, maximum(abs.(dQ .- power .* G.Qi[i])), maximum(abs.(dr .- power .* G.ri[i])))
@@ -361,19 +439,21 @@ function fit!(G::EPApprox; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, st
         # convergence criterion: :strict = max|Δμ| AND max site-param change
         # (the mean alone can be stationary in symmetric models — default);
         # :max = max|Δμ| only; :mean = mean|Δμ| (legacy ep_glm criterion,
-        # matches legacy cycle counts exactly — perf_gap.md §1)
-        dμ = mean(G) .- m
+        # matches legacy cycle counts exactly — perf_gap.md §1).
+        # Δμ goes into the workspace buffer (no per-cycle allocation).
+        dμ = ws.dμ
+        dμ .= st.μ .- m
         δ = if crit === :mean
-            mean(abs.(dμ))
+            sum(abs, dμ) / length(dμ)
         elseif crit === :max
-            maximum(abs.(dμ))
+            maximum(abs, dμ)
         else
-            max(maximum(abs.(dμ)), δsite)
+            max(maximum(abs, dμ), δsite)
         end
         δ < tol && break
-        m .= mean(G)
+        m .= st.μ
     end
-    sync!(G.state)
+    sync!(st)
     G.lastδ = δ
     δ < tol || @info "EP did not reach tolerance (δ=$δ); consider damping or more quadrature nodes"
     return G

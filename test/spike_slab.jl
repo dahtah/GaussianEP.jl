@@ -4,7 +4,7 @@
 # For m ≤ 3 coefficients the exact posterior is a mixture of 2^m Gaussians
 # (one per active subset), computable in closed form.
 
-using Random
+using Random, Distributions
 
 function _lse(v)
     m = maximum(v)
@@ -127,4 +127,62 @@ end
     G = ep(M; qr=QuadRule(20), tol=1e-6, maxcycles=30)   # must terminate
     @test isfinite(log_ml(G))
     @test all(isfinite, mean(G))
+end
+
+@testset "spike_slab_glm structure" begin
+    # likelihood sites on the design rows + one SpikeSlabLik prior site per coef
+    Random.seed!(0)
+    p, n = 3, 5
+    X = randn(p, n)
+    y = rand(Bool, n)
+    w, τ2 = 0.9, 10.0
+    M = spike_slab_glm(X, y, Logit(), w, τ2)
+    @test length(M.sites) == n + p
+    @test all(s -> s.lik isa Logit, M.sites[1:n])
+    @test all(s -> s.lik isa SpikeSlabLik && s.lik.w == w && s.lik.τ2 == τ2, M.sites[(n+1):(n+p)])
+    @test all(i -> M.sites[i].A ≈ reshape(X[:, i], 1, p), 1:n)
+    @test M.Q0 ≈ 1e-8 * Matrix{Float64}(I, p, p)
+    @test M.r0 == zeros(p)
+end
+
+@testset "spike_slab_glm_autotune: synthetic logistic regression" begin
+    sig(η) = 1 / (1 + exp(-η))
+    Random.seed!(3)
+    p, n, k = 40, 300, 5
+    X = randn(p, n)                       # X is p×n, as glm_model expects
+    S = sort(randperm(p)[1:k])
+    β = zeros(p); β[S] = randn(k) .* 2.0
+    y = rand.(Bernoulli.(sig.(X'β)))
+    ws = (0.5, 0.8, 0.9, 0.95); τ2s = (1.0, 10.0, 100.0)
+    at = spike_slab_glm_autotune(X, y, Logit(); ws=ws, τ2s=τ2s, maxcycles=100, tol=1e-8)
+    @test isfinite(at.logml)
+    @test at.w in ws && at.τ2 in τ2s
+    @test length(at.grid) == length(ws) * length(τ2s)      # every grid point recorded
+    @test all(g -> g.converged isa Bool, at.grid)          # all grid entries marked
+    @test count(g -> g.converged, at.grid) >= length(at.grid) - 2
+    @test at.logml == maximum(g.logml for g in at.grid if g.converged)
+    sup = GaussianEP.support(at.G)                          # PIP > 0.5
+    tp = length(intersect(sup, S)); fp = length(setdiff(sup, S))
+    @test tp >= 4          # recovers most of the 5 true nonzeros
+    @test fp <= 2          # few false positives
+    @test all(>(0.5), inclusion_probs(at.G)[sup])
+end
+
+@testset "spike_slab_glm_autotune: Poisson smoke test" begin
+    Random.seed!(7)
+    p, n, k = 12, 200, 3
+    X = randn(p, n)
+    S = sort(randperm(p)[1:k])
+    β = zeros(p); β[S] = [1.0, -0.8, 0.6]
+    y = Float64.(rand.(Poisson.(exp.(X'β))))
+    ws = (0.5, 0.8, 0.9); τ2s = (1.0, 10.0)
+    at = spike_slab_glm_autotune(X, y, PoisLik(); ws=ws, τ2s=τ2s, maxcycles=100, tol=1e-8)
+    @test isfinite(at.logml)
+    @test isfinite(log_ml(at.G))
+    @test length(at.grid) == length(ws) * length(τ2s)
+    @test all(g -> g.converged isa Bool, at.grid)
+    @test count(g -> g.converged, at.grid) >= 1
+    sup = GaussianEP.support(at.G)
+    tp = length(intersect(sup, S)); fp = length(setdiff(sup, S))
+    @test tp >= 2 && fp <= 2
 end

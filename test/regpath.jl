@@ -46,4 +46,29 @@ using Random, Distributions
     @test occursin("tau_opt", sa)
     @test occursin("logml", sa)
     @test length(sa) < 1000
+
+    # set_tau!: in-place τ change on a unit-base model matches a fresh model
+    # built directly at that τ (mean, cov, log_ml), on both backends
+    for backend in (:dense, :cholesky)
+        M1 = glm_model(X, y, Logit(), 1.0)          # unscaled base Q0 = I
+        G1 = EPApprox(M1; backend=backend)
+        GaussianEP.fit!(G1; maxcycles=50, tol=1e-8)
+        GaussianEP.set_tau!(G1, 0.5)
+        @test G1.state.τ == 0.5
+        GaussianEP.fit!(G1; maxcycles=50, tol=1e-8)
+        G2 = ep(glm_model(X, y, Logit(), 0.5); maxcycles=50, tol=1e-8)
+        @test maximum(abs.(mean(G1) .- mean(G2))) < 1e-6
+        @test maximum(abs.(cov(G1) .- cov(G2))) < 1e-6
+        @test abs(log_ml(G1) - log_ml(G2)) < 1e-6
+        # rebuild! respects the state's τ
+        GaussianEP.rebuild!(G1)
+        @test G1.state.τ == 0.5
+        @test abs(log_ml(G1) - log_ml(G2)) < 1e-6
+    end
+
+    # regpath on the cholesky backend stays finite and matches dense logml
+    pathc = glm_regpath(X, y, Logit(), 0.01, 10.0; nsteps=6, maxcycles=50, tol=1e-8,
+                        backend=:cholesky)
+    @test all(isfinite, pathc.logml)
+    @test maximum(abs.(pathc.logml .- path.logml)) < 1e-6
 end
