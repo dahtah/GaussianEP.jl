@@ -14,15 +14,15 @@ Recompute the state (`Q, r, Σ, μ, logdetQ`) from the model's base measure
 fit across hyperparameter values (e.g. a change of prior precision τ).
 """
 function rebuild!(G::EPApprox)
-    st = G.state
-    st.Q .= Matrix{Float64}(G.model.Q0)
-    st.r .= Vector{Float64}(G.model.r0)
-    for i in eachindex(G.model.sites)
-        A = G.model.sites[i].A
-        st.Q .+= A' * G.Qi[i] * A
-        st.r .+= A' * G.ri[i]
+    M = G.model
+    Q = Matrix{Float64}(M.Q0)
+    r = Vector{Float64}(M.r0)
+    for i in eachindex(M.sites)
+        A = M.sites[i].A
+        Q .+= A' * G.Qi[i] * A
+        r .+= A' * G.ri[i]
     end
-    sync!(st)
+    reset!(G.state, Q, r)     # backend-agnostic (DenseState / CholeskyState)
     return G
 end
 

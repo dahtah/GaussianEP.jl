@@ -26,7 +26,7 @@ end
 # compat: G.Q, G.Σ, G.μ, G.r forward to the state (read-only use)
 function Base.getproperty(G::EPApprox, s::Symbol)
     if s === :Q || s === :Σ || s === :μ || s === :r
-        return getfield(getfield(G, :state), s)
+        return getproperty(getfield(G, :state), s)
     end
     return getfield(G, s)
 end
@@ -81,9 +81,9 @@ end
 # question 8; root cause in pois_stability.md). The unit cavity keeps the init
 # nodes within ±7.6·√d with spacing ~0.7·√d. The init is only a starting
 # point — the EP fixed point is unchanged.
-function EPApprox(M::EPModel; qr=QuadRule(20), T=Float64, stein::Bool=false, power::Float64=1.0)
+function EPApprox(M::EPModel; qr=QuadRule(20), T=Float64, stein::Bool=false, power::Float64=1.0, backend::Symbol=:dense)
     n = nsites(M)
-    st = EPState(M.Q0, M.r0)
+    st = EPState(M.Q0, M.r0; backend=backend)
     Qi = Vector{Matrix{T}}(undef, n)
     ri = Vector{Vector{T}}(undef, n)
     for i in 1:n
@@ -189,7 +189,7 @@ function _site_update_apply_1d!(G::EPApprox, i, qr::QuadRule, stein::Bool, damp:
     s = G.model.sites[i]
     a = @view(s.A[1, :])
     st = G.state
-    Sa = st.Σ * a
+    Sa = Σa(st, a)
     sa2 = dot(a, Sa)                 # cavity marginal variance s = a'Σa
     ma = dot(a, st.μ)                # cavity mean m = a'μ
     if !(sa2 > 0) || !isfinite(sa2)
@@ -197,7 +197,7 @@ function _site_update_apply_1d!(G::EPApprox, i, qr::QuadRule, stein::Bool, damp:
         # skip the site if still bad — never enter the cavity loop with Si ≤ 0
         # (t_min would be negative and the halving loop would not terminate)
         sync!(st)
-        Sa = st.Σ * a
+        Sa = Σa(st, a)
         sa2 = dot(a, Sa)
         ma = dot(a, st.μ)
         if !(sa2 > 0) || !isfinite(sa2)
@@ -395,9 +395,12 @@ is how often (in cycles) the state is resynced from `Q` (Woodbury drift).
 (status.md; `test/quadrature.jl`). `crit` selects the convergence criterion:
 `:strict` (default) = max|Δμ| and max site-param change, `:max` = max|Δμ|,
 `:mean` = mean|Δμ| (the legacy `ep_glm` criterion, perf_gap.md §1).
+`backend=:dense` (default) uses the Woodbury `DenseState`; `backend=:cholesky`
+uses `CholeskyState` — exact rank-1 `lowrankupdate!`/`lowrankdowndate!` on the
+Cholesky factor of Q, no Woodbury drift (`src/state.jl`).
 """
-function ep(M::EPModel; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:strict)
-    G = EPApprox(M, qr=qr, stein=stein, power=power)
+function ep(M::EPModel; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:strict, backend::Symbol=:dense)
+    G = EPApprox(M, qr=qr, stein=stein, power=power, backend=backend)
     fit!(G, qr=qr, maxcycles=maxcycles, tol=tol, damp=damp, stein=stein, parallel=parallel, power=power, resync=resync, robust=robust, robust_tol=robust_tol, crit=crit)
 end
 

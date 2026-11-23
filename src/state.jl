@@ -11,6 +11,9 @@
 #   apply_site!(st, A, δQ, δr)   -> Bool     rank-d update: Q += A'δQ A, r += A'δr,
 #                                            Woodbury update of Σ, μ, logdetQ; false if skipped
 #   sync!(st)                             resync Σ, μ, logdetQ from Q (drift control)
+#   Σa(st, a)                            Σ * a  (matvec for DenseState, triangular
+#                                        solves for CholeskyState)
+#   reset!(st, Q, r)                     replace (Q, r) wholesale (warm starts)
 #   mean(st), cov(st), logdet(st), quadform(st)   quadform = r'Σr = r'μ
 #   logZ(st)                              log ∫ exp(-.5 x'Qx + r'x) dx
 #
@@ -33,11 +36,17 @@ mutable struct DenseState{T} <: AbstractEPState
 end
 
 # --- constructor dispatch (the sparse-case hook) ---
-EPState(Q0::AbstractMatrix, r0::AbstractVector) = DenseState(Q0, r0)
+# backend=:dense (default) -> DenseState (Woodbury), :cholesky -> CholeskyState
+# (exact rank-1 lowrankupdate!/lowrankdowndate! on the factor, no drift).
+EPState(Q0::AbstractMatrix, r0::AbstractVector; backend::Symbol=:dense) =
+    backend === :cholesky ? CholeskyState(Q0, r0) : DenseState(Q0, r0)
 # TODO sparse backends (linear_algebra.md §3): keep working today via the dense
 # fallback, swap in SparseState / sparse+low-rank state later.
-EPState(Q0::SparseMatrixCSC, r0::AbstractVector) = DenseState(Q0, r0)
-EPState(Q0::Diagonal, r0::AbstractVector) = DenseState(Q0, r0)
+EPState(Q0::SparseMatrixCSC, r0::AbstractVector; backend::Symbol=:dense) = DenseState(Q0, r0)
+EPState(Q0::Diagonal, r0::AbstractVector; backend::Symbol=:dense) = DenseState(Q0, r0)
+
+# Σa(st, a) = Σ * a — the one matvec the EP hot path needs per site
+Σa(st::DenseState, a::AbstractVector) = st.Σ * a
 
 function DenseState(Q0::AbstractMatrix, r0::AbstractVector)
     Q = Matrix{Float64}(Q0)
@@ -198,6 +207,14 @@ function apply_site!(st::DenseState, a::AV, δq::Real, δr::Real, Sa::Vector{Flo
     return (δq, δr)
 end
 
+# --- interface: replace (Q, r) wholesale (warm starts across hyperparameters) ---
+function reset!(st::DenseState, Q::AbstractMatrix, r::AbstractVector)
+    st.Q .= Q
+    st.r .= r
+    sync!(st)
+    return st
+end
+
 # --- interface: resync from Q (Woodbury drift control) ---
 function sync!(st::DenseState)
     C = try
@@ -218,4 +235,185 @@ end
 # diagnostic: how far Σ has drifted from Q⁻¹
 function drift(st::DenseState)
     return maximum(abs.(st.Σ .- inv(Symmetric(st.Q))))
+end
+
+# ---------------------------------------------------------------------------
+# CholeskyState: the Cholesky factor of Q is the source of truth (no Woodbury
+# drift). Rank-1 site updates use LinearAlgebra.lowrankupdate!/lowrankdowndate!
+# (Givens-based, O(p²), in-place on the factor); rank-d updates are applied as d
+# sequential rank-1 updates along the eigenvectors of δQ. The PD condition
+# K = 1 + s·δq > 0 is checked BEFORE downdating — it is exactly the condition
+# under which lowrankdowndate! cannot throw, so the factor is never corrupted.
+# Cavities and Σa use triangular solves (C \ a = Q⁻¹a). No resync needed in
+# exact arithmetic; sync! only re-factors to clean roundoff (linear_algebra.md §2).
+# ---------------------------------------------------------------------------
+mutable struct CholeskyState{T} <: AbstractEPState
+    C :: Cholesky{T, Matrix{T}}   # Q = C.L * C.L' (or U'U)
+    r :: Vector{T}
+    μ :: Vector{T}
+    logdetQ :: T
+end
+
+function CholeskyState(Q0::AbstractMatrix, r0::AbstractVector)
+    Q = Matrix{Float64}(Q0)
+    r = Vector{Float64}(r0)
+    C = cholesky(Symmetric(Q))
+    μ = C \ r
+    logdetQ = 2 * sum(log, diag(C.factors))
+    CholeskyState{Float64}(C, r, μ, logdetQ)
+end
+
+# compat: G.Q / G.Σ forwarding (EPApprox getproperty calls getproperty on the
+# state) — materialised on demand, O(p³), only for read-only external use
+function Base.getproperty(st::CholeskyState, s::Symbol)
+    if s === :Q
+        return Matrix(getfield(st, :C))
+    elseif s === :Σ
+        return inv(getfield(st, :C))
+    end
+    return getfield(st, s)
+end
+
+Statistics.mean(st::CholeskyState) = copy(st.μ)
+Statistics.cov(st::CholeskyState) = inv(st.C)
+LinearAlgebra.logdet(st::CholeskyState) = st.logdetQ
+quadform(st::CholeskyState) = dot(st.r, st.μ)
+logZ(st::CholeskyState) = 0.5*(length(st.r)*log(2π) - st.logdetQ + quadform(st))
+dim(st::CholeskyState) = length(st.r)
+Σa(st::CholeskyState, a::AbstractVector) = st.C \ a    # Q⁻¹a, two triangular solves
+drift(st::CholeskyState) = 0.0                          # factor is exact by construction
+
+function reset!(st::CholeskyState, Q::AbstractMatrix, r::AbstractVector)
+    st.C = cholesky(Symmetric(Matrix{Float64}(Q)))
+    st.r .= r
+    LinearAlgebra.ldiv!(st.μ, st.C, st.r)
+    st.logdetQ = 2 * sum(log, diag(st.C.factors))
+    return st
+end
+
+function sync!(st::CholeskyState)
+    st.C = cholesky(Symmetric(Matrix(st.C)))   # re-factor: clean roundoff only
+    LinearAlgebra.ldiv!(st.μ, st.C, st.r)
+    st.logdetQ = 2 * sum(log, diag(st.C.factors))
+    return st
+end
+
+marginal(st::CholeskyState, A::AM) where AM<:AbstractMatrix =
+    (A * st.μ, Symmetric(A * (st.C \ A')))
+
+function cavity(st::CholeskyState, a::AV, qi::Real, ri::Real, power::Float64=1.0) where AV<:AbstractVector
+    Sa = Σa(st, a)
+    s = dot(a, Sa)
+    m = dot(a, st.μ)
+    if !(s > 0) || !isfinite(s)      # factor roundoff: re-factor once
+        sync!(st)
+        Sa = Σa(st, a); s = dot(a, Sa); m = dot(a, st.μ)
+        !(s > 0) && (s = 1e-12)
+    end
+    Si = 1 / s
+    t_min = qi > 0 ? max(0.99 * Si / qi, 0.0) : 0.0
+    t = power
+    Λc = Si - t * qi
+    while Λc <= 0 && t > t_min
+        t /= 2
+        Λc = Si - t * qi
+    end
+    λc = Si * m - t * ri
+    Sc = 1 / Λc
+    (m = [Sc * λc], S = reshape([Sc], 1, 1))
+end
+
+function cavity(st::CholeskyState, A::AM, Qi::QM, ri::RV, power::Float64=1.0) where {AM<:AbstractMatrix, QM<:AbstractMatrix, RV<:AbstractVector}
+    S = Symmetric(A * (st.C \ A'))
+    m = A * st.μ
+    Si = _small_pd_inv(S)
+    QiS = Symmetric(Qi)
+    λmaxQi = maximum(eigvals(QiS))
+    t_min = max(λmaxQi > 0 ? 0.99 * minimum(eigvals(Si)) / λmaxQi : 0.0, 0.0)
+    t = power
+    Λc = Symmetric(Si - t*QiS)
+    while !isposdef(Λc) && t > t_min
+        t /= 2
+        Λc = Symmetric(Si - t*QiS)
+    end
+    λc = Si * m - t * ri
+    Sc = _small_pd_inv(Λc)
+    (m = Sc * λc, S = Sc)
+end
+
+# rank-1 apply: exact lowrankupdate!/lowrankdowndate! on the factor
+function apply_site!(st::CholeskyState, a::AV, δq::Real, δr::Real; rmax::Float64=1e12) where AV<:AbstractVector
+    Sa = Σa(st, a)
+    apply_site!(st, a, δq, δr, Sa, dot(a, Sa); rmax=rmax)
+end
+
+function apply_site!(st::CholeskyState, a::AV, δq::Real, δr::Real, Sa::Vector{Float64}, s::Float64; rmax::Float64=1e12) where AV<:AbstractVector
+    isfinite(δq) || (δq = 0.0)
+    isfinite(δr) || (δr = 0.0)
+    if !(s > 0) || !isfinite(s)
+        return nothing
+    end
+    K = 1 + s*δq
+    while (K <= 0 || abs(δr) > rmax) && (abs(δq) > 1e-14 || abs(δr) > rmax)
+        δq /= 2
+        δr /= 2
+        K = 1 + s*δq
+    end
+    (K > 0 && abs(δr) <= rmax) || return nothing
+    # K > 0 is exactly the PD condition for the downdate, so the factor update
+    # below cannot throw (lowrankdowndate! throws PosDefException iff v'Σv ≥ 1)
+    if δq > 0
+        LinearAlgebra.lowrankupdate!(st.C, sqrt(δq) .* a)
+    elseif δq < 0
+        LinearAlgebra.lowrankdowndate!(st.C, sqrt(-δq) .* a)
+    end
+    st.r .+= δr .* a
+    LinearAlgebra.ldiv!(st.μ, st.C, st.r)
+    st.logdetQ = 2 * sum(log, diag(st.C.factors))
+    return (δq, δr)
+end
+
+# rank-d apply: eigen-split δQ = V Λ V' and apply each component as a rank-1
+# update (λ > 0) or downdate (λ < 0, PD pre-checked per component; on failure
+# restore the factor from a backup and halve δ)
+function apply_site!(st::CholeskyState, A::AM, δQ::DQM, δr::DRV; rmax::Float64=1e12) where {AM<:AbstractMatrix, DQM<:AbstractMatrix, DRV<:AbstractVector}
+    SA = st.C \ A'                       # Σ A'
+    SAA = A * SA
+    δQc = copy(δQ); δrc = copy(δr)
+    all(isfinite, δQc) || fill!(δQc, zero(eltype(δQc)))
+    all(isfinite, δrc) || fill!(δrc, zero(eltype(δrc)))
+    K = I + SAA * δQc
+    while (!isposdef(Symmetric(K)) || maximum(abs.(δrc)) > rmax) &&
+          (maximum(abs.(δQc)) > 1e-14 || maximum(abs.(δrc)) > rmax)
+        δQc ./= 2
+        δrc ./= 2
+        K = I + SAA * δQc
+    end
+    (isposdef(Symmetric(K)) && maximum(abs.(δrc)) <= rmax) || return nothing
+    while true
+        F = eigen(Symmetric(δQc))
+        Cbak = copy(st.C)
+        ok = true
+        for (λ, v) in zip(F.values, eachcol(F.vectors))
+            abs(λ) < 1e-300 && continue
+            w = sqrt(abs(λ)) .* (A' * v)          # p-vector, Q += λ w w'... (sign via λ)
+            if λ > 0
+                LinearAlgebra.lowrankupdate!(st.C, w)
+            else
+                if !(1 - dot(w, Σa(st, w)) > 0)   # downdate would break PD
+                    ok = false
+                    break
+                end
+                LinearAlgebra.lowrankdowndate!(st.C, w)
+            end
+        end
+        ok && break
+        st.C = Cbak                                # restore and backtrack
+        δQc ./= 2; δrc ./= 2
+        (maximum(abs.(δQc)) > 1e-14 || maximum(abs.(δrc)) > rmax) || return nothing
+    end
+    st.r .+= A' * δrc
+    LinearAlgebra.ldiv!(st.μ, st.C, st.r)
+    st.logdetQ = 2 * sum(log, diag(st.C.factors))
+    return (δQc, δrc)
 end
