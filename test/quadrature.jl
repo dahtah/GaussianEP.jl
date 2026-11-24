@@ -161,3 +161,108 @@ end
     @test mean(Ga) ≈ mean(Gb) atol=1e-12
     @test log_ml(Ga) ≈ log_ml(Gb) atol=1e-12
 end
+
+# --- Smolyak sparse grids for rank 2-3 (status.md open question 7 remaining
+# part; TODO "Sparse grids (Smolyak) for rank 2-3 quadrature"). smolyak_rule
+# returns a QuadRule, so it plugs into tilted_moments / ep(...; qr=...) with
+# no changes at call sites (the rank-d path in moments.jl uses qr.grid).
+
+@testset "smolyak_rule basics" begin
+    # d=1 reduces to the level-`level` 1-D Gauss-Hermite rule
+    qr1 = GaussianEP.smolyak_rule(4, 1)
+    @test qr1 isa QuadRule
+    @test qr1.grid === nothing
+    @test length(qr1.x) == 2^3 + 1
+    @test sum(qr1.w) ≈ 1 atol=1e-14
+    @test qr1.logw ≈ log.(qr1.w)
+    # d=2,3: sparse grid stored in qr.grid, signed weights, sum(w)=1
+    for (q, d) in ((4,2), (5,2), (4,3), (5,3))
+        qr = GaussianEP.smolyak_rule(q, d)
+        @test qr isa QuadRule
+        @test qr.grid isa Matrix{Float64}
+        @test size(qr.grid) == (d, length(qr.w))
+        @test qr.logw ≈ log.(abs.(qr.w))
+        @test sum(qr.w) ≈ 1 atol=1e-12
+        @test any(<(0), qr.w)          # Smolyak combination has signed weights
+    end
+    # trap base: nested dyadic trapezoid rules on [-L,L], even sparser
+    q, d = 5, 2
+    qrt = GaussianEP.smolyak_rule(q, d, base=:trap)
+    @test length(qrt.w) < length(GaussianEP.smolyak_rule(q, d).w)
+    @test sum(qrt.w) ≈ 1 atol=1e-12
+    # argument checks
+    @test_throws ArgumentError GaussianEP.smolyak_rule(2, 3)            # level < d
+    @test_throws ArgumentError GaussianEP.smolyak_rule(3, 2, base=:bogus)
+    @test_throws ArgumentError GaussianEP.smolyak_rule(0, 2)
+end
+
+@testset "smolyak exactness on polynomials of degree 2*level-1" begin
+    nm(k) = isodd(k) ? 0.0 : prod(1:2:k-1)     # E[Z^k] for Z ~ N(0,1)
+    for (q, d) in ((4,2), (5,2), (5,3), (6,3))
+        qr = GaussianEP.smolyak_rule(q, d)
+        Z, w = qr.grid, qr.w
+        deg = 2q - 1
+        for α in Iterators.product(ntuple(_ -> 0:deg, d)...)
+            sum(α) > deg && continue
+            val = sum(w[n] * prod(Z[i,n]^α[i] for i in 1:d) for n in 1:size(Z,2))
+            @test val ≈ prod(nm(α[i]) for i in 1:d) atol=1e-8
+        end
+    end
+end
+
+@testset "smolyak node count strictly below the full tensor grid" begin
+    for (q, d) in ((4,2), (5,2), (6,2), (4,3), (5,3), (6,3))
+        qr = GaussianEP.smolyak_rule(q, d)
+        k = 2^(q-1) + 1                       # 1-D nodes of the top-level rule
+        @test length(qr.w) < k^d              # full tensor grid k^d at level q
+    end
+end
+
+@testset "smolyak tilted moments vs full tensor grid (rank 2 and 3)" begin
+    lik = ConfineLik(η -> 0.5*sum(abs2, η) + 0.1*sum(abs2, η)^2)
+    # rank 2: reference = full tensor GH(60) (3600 nodes)
+    m = [0.2, -0.4]; S = [0.8 0.1; 0.1 0.5]
+    ref = GaussianEP.tilted_moments(lik, nothing, m, S, QuadRule(60))
+    qs = GaussianEP.smolyak_rule(6, 2)                    # 203 nodes
+    ts = GaussianEP.tilted_moments(lik, nothing, m, S, qs)
+    err = max(abs(ts.lz - ref.lz), maximum(abs.(ts.μ .- ref.μ)), maximum(abs.(Matrix(ts.Σ) .- Matrix(ref.Σ))))
+    @test err < 1e-2
+    @test length(qs.w) < 33^2                              # full tensor at level 6
+    # rank 3: reference = full tensor GH(30) (27000 nodes)
+    m3 = [0.3, -0.2, 0.1]; S3 = [1.0 0.2 0.1; 0.2 0.8 0.15; 0.1 0.15 0.6]
+    ref3 = GaussianEP.tilted_moments(lik, nothing, m3, S3, QuadRule(30))
+    qs3 = GaussianEP.smolyak_rule(7, 3)                   # 1113 nodes
+    ts3 = GaussianEP.tilted_moments(lik, nothing, m3, S3, qs3)
+    err3 = max(abs(ts3.lz - ref3.lz), maximum(abs.(ts3.μ .- ref3.μ)), maximum(abs.(Matrix(ts3.Σ) .- Matrix(ref3.Σ))))
+    @test err3 < 3e-2
+    @test length(qs3.w) < 129^3                            # full tensor at level 7
+    # fractional power (fractional EP) also goes through the sparse path
+    tp = GaussianEP.tilted_moments(lik, nothing, m, S, qs, power=0.5)
+    tpr = GaussianEP.tilted_moments(lik, nothing, m, S, QuadRule(60), power=0.5)
+    @test abs(tp.lz - tpr.lz) < 1e-2
+    # a d>=2 sparse rule is rejected on rank-1 sites ...
+    @test_throws ArgumentError GaussianEP.tilted_moments(Logit(), true, [0.1], [0.5;;], GaussianEP.smolyak_rule(4, 2))
+    # ... but smolyak_rule(level, 1) works on rank-1 sites (it is the 1-D rule)
+    t1 = GaussianEP.tilted_moments(Logit(), true, [0.1], [0.5;;], GaussianEP.smolyak_rule(5, 1))
+    t1r = GaussianEP.tilted_moments(Logit(), true, [0.1], [0.5;;], QuadRule(17))
+    @test t1.lz ≈ t1r.lz atol=1e-12
+    @test t1.μ ≈ t1r.μ atol=1e-12
+end
+
+@testset "ep with a Smolyak rule on a small rank-2 model" begin
+    # two rank-2 sites with a smooth (asymmetric) quartic confinement
+    c = [0.5, -0.3]
+    lik = ConfineLik(η -> 0.5*sum(abs2, η .- c) + 0.1*sum(abs2, η)^2)
+    m = 4
+    A2 = [1.0 0.0 0.3 0.0; 0.0 1.0 0.0 0.2]
+    M = EPModel(Matrix(I, m, m), [Site(A2, 0.0, lik), Site([0.0 0.0 1.0 0.0; 0.0 0.0 0.0 1.0], 0.0, lik)])
+    qs = GaussianEP.smolyak_rule(8, 2)                     # 992 nodes
+    Gs = ep(M, qr=qs, tol=1e-11, maxcycles=200)
+    Gf = ep(M, qr=QuadRule(40), tol=1e-11, maxcycles=200)  # 1600 nodes, converged
+    @test isfinite(log_ml(Gs))
+    @test abs(log_ml(Gs) - log_ml(Gf)) < 5e-3              # logml agreement
+    @test maximum(abs.(mean(Gs) - mean(Gf))) < 1e-3
+    @test maximum(abs.(cov(Gs) - cov(Gf))) < 5e-3
+    # the sparse grid is much smaller than the full tensor grid at level 8
+    @test length(qs.w) < (2^7 + 1)^2
+end

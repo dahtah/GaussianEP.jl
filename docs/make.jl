@@ -24,8 +24,8 @@ if isdir(NOTEBOOKS_IN)
     end
     for file in sort(readdir(NOTEBOOKS_IN; join = true))
         if endswith(file, ".jl")
-            out = Literate.markdown(file, NOTEBOOKS_OUT; documenter = true, execute = true)
-            push!(notebook_pages, "notebooks/" * basename(out))
+            mdfile = Literate.markdown(file, NOTEBOOKS_OUT; documenter = true, execute = true)
+            push!(notebook_pages, "notebooks/" * basename(mdfile))
         end
     end
 end

@@ -19,11 +19,11 @@ precision τ).
 function rebuild!(G::EPApprox)
     M = G.model
     st = G.state
-    Q = st.τ .* Matrix{Float64}(M.Q0)
+    Q = st.τ .* M.Q0
     r = Vector{Float64}(M.r0)
     for i in eachindex(M.sites)
         A = M.sites[i].A
-        Q .+= A' * G.Qi[i] * A
+        Q = Q + A' * G.Qi[i] * A
         r .+= A' * G.ri[i]
     end
     reset!(st, Q, r)          # backend-agnostic (DenseState / CholeskyState)
@@ -45,7 +45,7 @@ function set_tau!(G::EPApprox, τ::Real)
     st = G.state
     τ == st.τ && return G
     M = G.model
-    Q0 = Matrix{Float64}(M.Q0)
+    Q0 = M.Q0                        # keep its type (sparse stays sparse)
     Q = st.Q .+ (τ - st.τ) .* Q0     # st.Q = st.τ·Q0 + Σ A'QiA  (st.Q materialises for CholeskyState)
     reset!(st, Q, st.r)              # r = r0 + Σ A'ri is τ-independent
     st.τ = τ

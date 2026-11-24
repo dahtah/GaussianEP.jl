@@ -16,6 +16,12 @@ gets published below.
   `docs/notebooks/gp_classification_literate.jl`; the same example is also
   available as the standalone script `docs/notebooks/gp_classification.jl`
   (rendered to [notebooks/gp_classification.md](notebooks/gp_classification.md)).
+- [Sparse GMRF backend](notebooks/gmrf_sparse.md) — 1D Gaussian Markov random
+  field with Bernoulli-logistic observations (`gmrf_1d`, tridiagonal `Q0`),
+  run with the `SparseState` backend: `backend=:auto`/`:sparse` vs `:dense`
+  agreement on a small problem, posterior field plot, and `parallel=true`
+  (Jacobi) with timing at `p = 3000`. Rendered from
+  `docs/notebooks/gmrf_sparse.jl`.
 
 To add your own notebook, drop a `my_example.jl` Literate script into
 `docs/notebooks/` and rebuild the docs — it will appear here automatically.

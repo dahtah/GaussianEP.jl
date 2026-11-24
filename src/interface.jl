@@ -1,4 +1,30 @@
 Distributions.MultivariateNormal(G :: AbstractGaussApprox) = MultivariateNormal(mean(G),Symmetric(cov(G)))
+Distributions.MultivariateNormal(G :: EPApprox) = MultivariateNormal(mean(G),Symmetric(cov(G)))
+
+# ---------------------------------------------------------------------------
+# Legacy GLM API, rewired onto the new EP core (status.md open question 5 /
+# TODO "Rewire ep_glm onto the new core"): there is a single EP implementation
+# (`EPApprox` over an `EPModel`, src/ep.jl). `GLMApprox` is kept as a compat
+# alias of `EPApprox`, and `ep_glm` is a thin wrapper that builds a
+# `glm_model` and calls `ep`. The legacy convergence criterion (mean|Δμ| per
+# cycle) maps to the new core's `crit=:mean`.
+# ---------------------------------------------------------------------------
+const GLMApprox = EPApprox
+
+# legacy constructor GLMApprox(S, τ): an EPApprox over glm_model(S.X, S.y, S.lik, τ)
+GLMApprox(S::GLMSites, τ::Real=.01) = EPApprox(glm_model(S.X, S.y, S.lik, Float64(τ)); qr=S.qr)
+
+# legacy fit!(G, S, maxcycles, tol): sequential EP with the legacy criterion
+function fit!(G::EPApprox, S::GLMSites, maxcycles=24, tol=.001)
+    fit!(G; qr=S.qr, maxcycles=maxcycles, tol=tol, crit=:mean)
+end
+
+#for debugging
+function check_consistency(G::EPApprox)
+    C = cholesky(Symmetric(G.Q))
+    @assert G.Σ ≈ C \ Matrix{Float64}(I,size(G.Q))
+    @assert G.μ ≈ G.Σ*G.r
+end
 
 function logreg(X,y)
     ep_glm(X,y,Logit())
@@ -7,6 +33,12 @@ end
     ep_glm(X,y,l :: Likelihood;max_cycles=20,tol=1e-5,τ=.01,nquad=20)
 
 Estimate a GLΜ using Expectation Propagation.
+
+Thin wrapper over the new EP core: builds `glm_model(X, y, l, τ)` and runs
+`ep(...; qr=QuadRule(nquad), maxcycles=max_cycles, tol=tol, crit=:mean)`
+(`crit=:mean` is the legacy convergence criterion, mean|Δμ| per cycle), so
+there is a single EP implementation. Returns the `EPApprox` (aliased
+`GLMApprox`).
 
 # Arguments
 
@@ -20,14 +52,12 @@ Estimate a GLΜ using Expectation Propagation.
 """
 function ep_glm(X,y,l :: Likelihood;max_cycles=20,tol=1e-5,τ=.01,nquad=20)
     qr = QuadRule(nquad)
-    S=GLMSites(X,y,l,qr)
     if τ == :autotune
+        S = GLMSites(X,y,l,qr)
         τ_opt,G=_autotune_tau(S,10,.01)
         @info "Optimal value of prior precision τ : $(τ_opt)"
     else
-
-        G=GLMApprox(S,τ)
-        fit!(G,S,max_cycles,tol)
+        G = ep(glm_model(X, y, l, τ); qr=qr, maxcycles=max_cycles, tol=tol, crit=:mean)
     end
     G
 end
@@ -51,7 +81,7 @@ function logpost(S::GLMSites,Q0 :: Matrix,f)
     s-((1/2)*f'*Q0*f)
 end
 
-function is_correction(G :: GLMApprox,S :: GLMSites,ns,γ=1.1)
+function is_correction(G::GLMApprox,S :: GLMSites,ns,γ=1.1)
     xx,lw=importance_sampling(G,S,ns,γ)
     ee=ess(lw)
     @info "ESS: $(ee), ESS/n: $(ee/ns)"
@@ -62,11 +92,12 @@ function is_correction(G :: GLMApprox,S :: GLMSites,ns,γ=1.1)
     (logz,m,S)
 end
 
-function importance_sampling(G :: GLMApprox,S :: GLMSites,ns,γ=1.1)
+function importance_sampling(G::GLMApprox,S :: GLMSites,ns,γ=1.1)
     lw = zeros(ns)
     N = MultivariateNormal(mean(G),γ*Symmetric(cov(G)))
-    #prior covariance Q0⁻¹ via Cholesky (Q0 = τI is symmetric PD)
-    C0 = cholesky(Symmetric(G.Q0))
+    #prior covariance (τ·Q0)⁻¹ via Cholesky (effective prior precision is st.τ·Q0)
+    Q0 = G.state.τ .* Matrix{Float64}(G.model.Q0)
+    C0 = cholesky(Symmetric(Q0))
     P = MultivariateNormal(zeros(dim(G)),Symmetric(C0 \ Matrix{Float64}(I,dim(G),dim(G))))
     z = rand(N,ns)
     for i in 1:ns
@@ -84,56 +115,105 @@ function log_ess(lw)
     2*logsumexp(lw)-logsumexp(2*lw)
 end
 
-#For debugging - log ML for Gaussian data
-function log_ml_gaussian(G,y)
+#For debugging - log ML for Gaussian data (GLM sites have A_i = X[:,i]', so the
+#p×n design matrix is recovered from the sites)
+function log_ml_gaussian(G::GLMApprox,y)
+    M = G.model
+    X = reduce(hcat, [s.A' for s in M.sites])
     n = length(y)
-    N = MultivariateNormal(zeros(n),Symmetric(G.X'*(G.Q0\G.X)+I))
+    Q0 = G.state.τ .* Matrix{Float64}(M.Q0)
+    N = MultivariateNormal(zeros(n),Symmetric(X'*(Q0\X)+I))
     logpdf(N,y)
 end
 
 
 
-
-function _regpath_tau(S,τ0,τ1;nsteps=10)
-    m,n = size(S.X)
-    G0=GLMApprox(S,τ0)
+# Regularisation path over τ on the new core, with the legacy signature:
+# returns (τs ascending, μs, logmls). One model (unscaled base Q0 = I) and one
+# EPApprox are built for the whole path; the grid point τ is moved in place
+# with set_tau! (one refactorisation, no per-site loop) and the site
+# parameters are warm-started across grid points.
+function _regpath_tau(S,τ0,τ1;nsteps=10,maxcycles=24,tol=1e-3,qr=S.qr)
+    m = size(S.X,1)
     μs = zeros(m,nsteps)
-    lt = range(log(τ0),log(τ1),nsteps)
-    τs = exp.(lt)
+    τs = exp.(range(log(τ0),log(τ1),nsteps))
     lz = zeros(nsteps)
-    for (i,τ) = enumerate(τs)
-        set_tau!(G0,τ)
-        GaussianEP.fit!(G0,S)
-        μs[:,i] = mean(G0)
-        lz[i] = log_ml(G0)
+    M = glm_model(S.X, S.y, S.lik, 1.0)
+    G = EPApprox(M; qr=qr)
+    for (i,τ) in enumerate(τs)
+        set_tau!(G,τ)
+        fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, crit=:mean)
+        μs[:,i] = mean(G)
+        lz[i] = log_ml(G)
     end
     τs,μs,lz
 end
 
-function _autotune_tau(S,τ0,τ1;nsteps=10)
-    m,n = size(S.X)
-    G0=GLMApprox(S,τ0)
-    GaussianEP.fit!(G0,S)
-    μ = mean(G0)
-    C = cov(G0)
-    lt = range(log(τ0),log(τ1),nsteps)
-    τs = exp.(lt)
-    lz = log_ml(G0)
+# Empirical-Bayes selection of τ on the new core, legacy signature: scans the
+# grid (warm-started, τ moved in place with set_tau!) and refits at the τ
+# maximising the EP log marginal likelihood. Returns (τ_opt=..., G=...).
+function _autotune_tau(S,τ0,τ1;nsteps=10,maxcycles=24,tol=1e-3,qr=S.qr)
+    τs = exp.(range(log(τ0),log(τ1),nsteps))
+    M = glm_model(S.X, S.y, S.lik, 1.0)
+    G = EPApprox(M; qr=qr)
+    set_tau!(G,τ0)
+    fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, crit=:mean)
+    lz = log_ml(G)
     τ_opt=τ0
-    for (i,τ) = enumerate(τs)
-        set_tau!(G0,τ)
-        GaussianEP.fit!(G0,S)
-        nz = log_ml(G0)
+    for τ in τs
+        set_tau!(G,τ)
+        fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, crit=:mean)
+        nz = log_ml(G)
         if nz > lz
             lz = nz
-            μ = mean(G0)
-            C = cov(G0)
             τ_opt = τ
         end
     end
-    set_tau!(G0,τ_opt)
-    GaussianEP.fit!(G0,S)
-    (τ_opt=τ_opt,G=G0)
+    set_tau!(G,τ_opt)
+    fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, crit=:mean)
+    (τ_opt=τ_opt,G=G)
 end
 
+# ---------------------------------------------------------------------------
+# Log-density of the EP approximation at a point (status.md TODO: convenience
+# function for mode-finding with Optim.jl). The EP approximation is
+#   q(x) = N(x; μ, Σ) ∏ᵢ fᵢ(Aᵢx) / tᵢ(Aᵢx),
+# with tᵢ(η) = exp(-½ η'Qᵢη + rᵢ'η) the Gaussian site factor with the stored
+# site parameters (G.Qi[i], G.ri[i]), so
+#   log q(x) = log N(x; μ, Σ) + Σᵢ [log_dens(likᵢ, Aᵢx, yᵢ) + ½ (Aᵢx)'Qᵢ(Aᵢx) - rᵢ'(Aᵢx)]
+# (up to an additive constant — the site factors tᵢ are unnormalized). The
+# Gaussian part is evaluated in natural form, -½(x-μ)'Q(x-μ) - ½logdet Q -
+# (m/2)log 2π, so it works for every state backend (a sparse Q stays sparse).
+# ForwardDiff-compatible: x may carry duals, so
+# ForwardDiff.gradient(x -> logdensity(G, x), x0) gives the gradient.
+# ---------------------------------------------------------------------------
+"""
+    logdensity(G::EPApprox, x::AbstractVector)
 
+Log-density of the EP approximation at `x`, up to an additive constant:
+`q(x) = N(x; μ, Σ) ∏ᵢ fᵢ(Aᵢx)/tᵢ(Aᵢx)` with `tᵢ(η) = exp(-½ η'Qᵢη + rᵢ'η)` the
+Gaussian site factor (`G.Qi[i]`, `G.ri[i]`), i.e.
+`log q(x) = log N(x; μ, Σ) + Σᵢ (log_dens(likᵢ, Aᵢx, yᵢ) + ½ (Aᵢx)'Qᵢ(Aᵢx) - rᵢ'(Aᵢx))`.
+Convenience function for e.g. finding the mode with Optim.jl
+(`optimize(x -> -logdensity(G, x), mean(G))`); `x` may carry ForwardDiff
+duals, so `ForwardDiff.gradient(x -> logdensity(G, x), x0)` works.
+"""
+function logdensity(G::EPApprox, x::AbstractVector)
+    st = G.state
+    m = dim(G)
+    dx = x .- G.μ
+    lq = -0.5 * dot(dx, G.Q * dx) - 0.5 * logdet(st) - 0.5 * m * log(2π)
+    for i in 1:nsites(G)
+        s = G.model.sites[i]
+        Qi = G.Qi[i]
+        ri = G.ri[i]
+        if size(s.A, 1) == 1
+            η = (s.A * x)[1]              # scalar η = A x (rank-1 site)
+            lq += log_dens(s.lik, η, s.y) + 0.5 * Qi[1, 1] * η^2 - ri[1] * η
+        else
+            η = s.A * x
+            lq += log_dens(s.lik, η, s.y) + 0.5 * dot(η, Qi * η) - dot(ri, η)
+        end
+    end
+    return lq
+end

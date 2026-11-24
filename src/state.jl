@@ -17,6 +17,20 @@
 #   mean(st), cov(st), logdet(st), quadform(st)   quadform = r'Σr = r'μ
 #   logZ(st)                              log ∫ exp(-.5 x'Qx + r'x) dx
 #
+# SparseState (scenario 3B of linear_algebra.md, everything sparse — Ising /
+# gas / GMRF on a grid): the sparse Q, r are the source of truth; a CHOLMOD
+# factor (stdlib SparseArrays.CHOLMOD, AMD ordering) is cached and refreshed
+# by `ensure_fresh!` whenever Q changed (`stale` flag). Site updates
+# accumulate into the sparse Q (O(nnz(a)²) for a rank-1 site with sparse row
+# a) and mark the factor stale; the next read refactorizes once — measured
+# cheaper than per-site CHOLMOD up/downdates on 2-D grids (sparse_backends.md:
+# fresh factor 5–14 ms vs rank-1 updown ~45 ms at p=10⁴), so sequential EP
+# refactorizes per site (cheap for banded 1-D Q) and the parallel/batched path
+# refactorizes once per sweep. PD pre-check K = 1 + s·δq > 0 before accepting a
+# negative-δq update (a failed CHOLMOD downdate corrupts the factor silently,
+# so we never rely on updown here). No new dependency: CHOLMOD is in the
+# SparseArrays stdlib on Julia 1.13.
+#
 # The state also carries `τ`, the scale of the base measure: the model's Q0 is
 # interpreted as the UNSCALED base and the effective prior precision matrix is
 # τ·Q0 (τ = 1 by default, so a model with Q0 already scaled is unaffected).
@@ -44,14 +58,17 @@ mutable struct DenseState{T} <: AbstractEPState
 end
 
 # --- constructor dispatch (the sparse-case hook) ---
-# backend=:dense (default) -> DenseState (Woodbury), :cholesky -> CholeskyState
-# (exact rank-1 lowrankupdate!/lowrankdowndate! on the factor, no drift).
-EPState(Q0::AbstractMatrix, r0::AbstractVector; backend::Symbol=:dense) =
-    backend === :cholesky ? CholeskyState(Q0, r0) : DenseState(Q0, r0)
-# TODO sparse backends (linear_algebra.md §3): keep working today via the dense
-# fallback, swap in SparseState / sparse+low-rank state later.
-EPState(Q0::SparseMatrixCSC, r0::AbstractVector; backend::Symbol=:dense) = DenseState(Q0, r0)
-EPState(Q0::Diagonal, r0::AbstractVector; backend::Symbol=:dense) = DenseState(Q0, r0)
+# backend=:auto (default) -> SparseState for sparse Q0, DenseState otherwise;
+# :dense -> DenseState (Woodbury), :cholesky -> CholeskyState (exact rank-1
+# lowrankupdate!/lowrankdowndate! on the factor, no drift), :sparse -> SparseState.
+EPState(Q0::AbstractMatrix, r0::AbstractVector; backend::Symbol=:auto) =
+    backend === :cholesky ? CholeskyState(Q0, r0) :
+    backend === :sparse ? SparseState(Q0, r0) : DenseState(Q0, r0)
+EPState(Q0::SparseMatrixCSC, r0::AbstractVector; backend::Symbol=:auto) =
+    backend === :dense ? DenseState(Q0, r0) :
+    backend === :cholesky ? CholeskyState(Q0, r0) : SparseState(Q0, r0)
+EPState(Q0::Diagonal, r0::AbstractVector; backend::Symbol=:auto) =
+    backend === :sparse ? SparseState(Q0, r0) : DenseState(Q0, r0)
 
 # Σa(st, a) = Σ * a — the one matvec the EP hot path needs per site
 Σa(st::DenseState, a::AbstractVector) = st.Σ * a
@@ -182,6 +199,7 @@ end
 # same math as the generic path with d=1 but without forming d×d matrices
 function apply_site!(st::DenseState, a::AV, δq::Real, δr::Real; rmax::Float64=1e12) where AV<:AbstractVector
     Sa = st.Σ * a
+    Sa = Sa isa AbstractSparseVector ? Vector(Sa) : Sa
     apply_site!(st, a, δq, δr, Sa, dot(a, Sa); rmax=rmax)
 end
 
@@ -189,6 +207,9 @@ end
 # the cavity computation in the fused hot path — saves one O(p²) matvec per
 # site, perf_gap.md §7.3)
 function apply_site!(st::DenseState, a::AV, δq::Real, δr::Real, Sa::Vector{Float64}, s::Float64; rmax::Float64=1e12) where AV<:AbstractVector
+    if a isa AbstractSparseVector            # sparse site row on a dense backend
+        a = Vector(a)
+    end
     isfinite(δq) || (δq = 0.0)
     isfinite(δr) || (δr = 0.0)
     if !(s > 0) || !isfinite(s)
@@ -353,10 +374,14 @@ end
 # rank-1 apply: exact lowrankupdate!/lowrankdowndate! on the factor
 function apply_site!(st::CholeskyState, a::AV, δq::Real, δr::Real; rmax::Float64=1e12) where AV<:AbstractVector
     Sa = Σa(st, a)
+    Sa = Sa isa AbstractSparseVector ? Vector(Sa) : Sa
     apply_site!(st, a, δq, δr, Sa, dot(a, Sa); rmax=rmax)
 end
 
 function apply_site!(st::CholeskyState, a::AV, δq::Real, δr::Real, Sa::Vector{Float64}, s::Float64; rmax::Float64=1e12) where AV<:AbstractVector
+    if a isa AbstractSparseVector            # sparse site row on a dense backend
+        a = Vector(a)
+    end
     isfinite(δq) || (δq = 0.0)
     isfinite(δr) || (δr = 0.0)
     if !(s > 0) || !isfinite(s)
@@ -424,5 +449,262 @@ function apply_site!(st::CholeskyState, A::AM, δQ::DQM, δr::DRV; rmax::Float64
     st.r .+= A' * δrc
     LinearAlgebra.ldiv!(st.μ, st.C, st.r)
     st.logdetQ = 2 * sum(log, diag(st.C.factors))
+    return (δQc, δrc)
+end
+
+# ---------------------------------------------------------------------------
+# SparseState: sparse Q (source of truth) + cached CHOLMOD factor.
+# Scenario 3B of linear_algebra.md — see sparse_backends.md for the package
+# investigation and benchmarks that motivated this design.
+# ---------------------------------------------------------------------------
+mutable struct SparseState{T} <: AbstractEPState
+    Q :: SparseMatrixCSC{T,Int}
+    r :: Vector{T}
+    F :: SparseArrays.CHOLMOD.Factor{T,Int}   # cached factor of Q (valid iff !stale)
+    μ :: Vector{T}
+    logdetQ :: T
+    τ :: T          # scale of the base measure: effective Q0 = τ·Q0 (default 1)
+    stale :: Bool   # true iff Q/r changed since the last factorization
+    frozen :: Bool  # true inside a parallel (Jacobi) sweep: reads use the sweep-start factor
+    jacobi :: Bool  # frozen && jacobi: downdates are checked against the stale s
+    shift :: T      # diagonal shift the last factorization needed (0 = Q was PD)
+    approx_check :: Bool  # frozen && approx_check: downdates use the cached s (no refactor)
+end
+
+function SparseState(Q0::AbstractMatrix, r0::AbstractVector)
+    Q = sparse(Q0)
+    r = Vector{Float64}(r0)
+    st = SparseState{Float64}(Q, r, ldlt(Symmetric(Q)), zeros(Float64, size(Q,1)), 0.0, 1.0, true, false, false, 0.0, false)
+    sync!(st)   # stale=true so this computes μ and logdetQ from the factor
+    return st
+end
+
+# CHOLMOD LDL' factorization (simplicial — measured ~10x faster triangular
+# solves than the supernodal LL factor on tridiagonal/grid patterns, and less
+# fill) with escalating diagonal shift. Inside a frozen sweep the K = 1+s·δq > 0
+# pre-check runs against the sweep-start factor, so the accumulated Q can lose
+# PD (sum of individually-PD downdates; strong Ising couplings) — a failed
+# factorization throws PosDefException. The shift is applied inside CHOLMOD
+# (Q itself is never modified), so the cache corresponds to Q + εI with ε only
+# as large as needed; the last shift 2p·scale always succeeds since
+# λ_min ≥ -λ_max ≥ -tr(Q) = -p·scale.
+function _sparse_ldlt(Q::SparseMatrixCSC)
+    try
+        return ldlt(Symmetric(Q)), 0.0
+    catch e
+        e isa PosDefException || rethrow()
+    end
+    p = size(Q, 1)
+    scale = sum(abs, diag(Q)) / max(p, 1)
+    for ε in (1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-2, 1.0, 2p)
+        try
+            return ldlt(Symmetric(Q); shift=ε * scale), ε * scale
+        catch e
+            e isa PosDefException || rethrow()
+        end
+    end
+    error("SparseState: could not factor Q even with shift 2p·scale")
+end
+
+# refactor the cached factor if Q changed since the last factorization
+# (skipped while frozen — the EP sweep reads the sweep-start factor, so the
+# refactor happens once per sweep, not once per site)
+function ensure_fresh!(st::SparseState)
+    if getfield(st, :stale) && !getfield(st, :frozen)
+        F, sh = _sparse_ldlt(getfield(st, :Q))          # CHOLMOD LDL', AMD ordering
+        st.F = F
+        st.shift = sh
+        if sh > 0
+            @warn "SparseState: Q lost positive-definiteness inside a sweep; factorizing Q + εI with ε=$sh" maxlog=1
+        end
+        LinearAlgebra.ldiv!(getfield(st, :μ), st.F, getfield(st, :r))
+        st.logdetQ = logdet(st.F)
+        st.stale = false
+    end
+    return st
+end
+
+# freeze/thaw bracket one parallel (Jacobi) sweep: all cavity reads and site
+# applies inside the sweep use the factor from the sweep start — one
+# refactorization + n solves per sweep instead of n refactorizations.
+# Sequential sweeps do NOT freeze: they refactor per site (exact Gauss-Seidel,
+# same semantics as the dense backend).
+freeze!(st::SparseState) = (st.frozen = true; st)
+thaw!(st::SparseState) = (st.frozen = false; ensure_fresh!(st))
+
+# compat: G.Q / G.Σ / G.μ forwarding. :Q is the sparse Q itself; :Σ, :μ,
+# :logdetQ are served from the (refreshed) factor — :Σ materializes a dense
+# inverse, O(p³)-ish, read-only external use only.
+function Base.getproperty(st::SparseState, s::Symbol)
+    if s === :μ || s === :logdetQ
+        ensure_fresh!(st)
+        return getfield(st, s)
+    elseif s === :Σ
+        ensure_fresh!(st)
+        p = size(getfield(st, :Q), 1)
+        return Matrix(getfield(st, :F) \ Matrix{Float64}(I, p, p))
+    end
+    return getfield(st, s)
+end
+
+Statistics.mean(st::SparseState) = copy(st.μ)
+Statistics.cov(st::SparseState) = st.Σ
+LinearAlgebra.logdet(st::SparseState) = st.logdetQ
+quadform(st::SparseState) = dot(st.r, st.μ)
+logZ(st::SparseState) = 0.5*(length(st.r)*log(2π) - st.logdetQ + quadform(st))
+dim(st::SparseState) = size(st.Q, 1)
+drift(st::SparseState) = 0.0                          # factor is exact when fresh
+
+# Σa = Q⁻¹a via the cached factor (one sparse triangular solve pair)
+function Σa(st::SparseState, a::AbstractVector)
+    ensure_fresh!(st)
+    return st.F \ a
+end
+
+function reset!(st::SparseState, Q::AbstractMatrix, r::AbstractVector)
+    st.Q = sparse(Q)          # replace (sparsity pattern may differ), not .= 
+    st.r .= r
+    st.stale = true
+    st.frozen = false
+    st.jacobi = false
+    st.approx_check = false
+    return st
+end
+
+sync!(st::SparseState) = ensure_fresh!(st)
+
+# sparse base-measure partition via CHOLMOD (no densification of Q0)
+function safe_log_partition(Q0::SparseMatrixCSC, r0::AbstractVector)
+    F = ldlt(Symmetric(Q0))
+    return 0.5*(length(r0)*log(2π) - logdet(F) + dot(r0, F \ r0))
+end
+
+marginal(st::SparseState, A::AM) where AM<:AbstractMatrix = begin
+    ensure_fresh!(st)
+    (A * st.μ, Symmetric(Matrix(A * (st.F \ A'))))
+end
+
+function cavity(st::SparseState, a::AV, qi::Real, ri::Real, power::Float64=1.0) where AV<:AbstractVector
+    Sa = Σa(st, a)
+    s = dot(a, Sa)
+    m = dot(a, st.μ)
+    if !(s > 0) || !isfinite(s)      # factor roundoff: re-factor once
+        sync!(st)
+        Sa = Σa(st, a); s = dot(a, Sa); m = dot(a, st.μ)
+        !(s > 0) && (s = 1e-12)
+    end
+    Si = 1 / s
+    t_min = qi > 0 ? max(0.99 * Si / qi, 0.0) : 0.0
+    t = power
+    Λc = Si - t * qi
+    while Λc <= 0 && t > t_min
+        t /= 2
+        Λc = Si - t * qi
+    end
+    λc = Si * m - t * ri
+    Sc = 1 / Λc
+    (m = [Sc * λc], S = reshape([Sc], 1, 1))
+end
+
+function cavity(st::SparseState, A::AM, Qi::QM, ri::RV, power::Float64=1.0) where {AM<:AbstractMatrix, QM<:AbstractMatrix, RV<:AbstractVector}
+    ensure_fresh!(st)
+    S = Symmetric(Matrix(A * (st.F \ A')))
+    m = A * st.μ
+    Si = _small_pd_inv(S)
+    QiS = Symmetric(Qi)
+    λmaxQi = maximum(eigvals(QiS))
+    t_min = max(λmaxQi > 0 ? 0.99 * minimum(eigvals(Si)) / λmaxQi : 0.0, 0.0)
+    t = power
+    Λc = Symmetric(Si - t*QiS)
+    while !isposdef(Λc) && t > t_min
+        t /= 2
+        Λc = Symmetric(Si - t*QiS)
+    end
+    λc = Si * m - t * ri
+    Sc = _small_pd_inv(Λc)
+    (m = Sc * λc, S = Sc)
+end
+
+# accumulate a rank-1 update into the sparse Q/r. Unary sites (nnz(a)==1,
+# the GMRF case) touch a single diagonal entry — do it directly, avoiding an
+# O(p) sparse outer product + broadcast per site.
+function _rank1_update!(st::SparseState, a::AbstractVector, δq::Real, δr::Real)
+    if a isa AbstractSparseVector && nnz(a) == 1
+        i, v = findnz(a)
+        st.Q[i[1], i[1]] += δq * v[1] * v[1]
+        st.r[i[1]] += δr * v[1]
+    else
+        sa = a isa AbstractSparseVector ? a : sparse(a)
+        st.Q .+= δq .* (sa * sa')
+        st.r .+= δr .* sa
+    end
+    st.stale = true
+    return st
+end
+
+# rank-1 apply: PD pre-check K = 1 + s·δq > 0 (the no-throw condition of a
+# downdate), then accumulate into the sparse Q and mark the factor stale —
+# the next read refactorizes once (sparse_backends.md: cheaper than per-site
+# CHOLMOD up/downdates on grids).
+function apply_site!(st::SparseState, a::AV, δq::Real, δr::Real; rmax::Float64=1e12) where AV<:AbstractVector
+    if getfield(st, :frozen) && getfield(st, :jacobi) && δq >= 0 && isfinite(δr) && abs(δr) <= rmax
+        # up-site inside a Jacobi sweep: PD-safe without a solve
+        # (K = 1 + s·δq > 0 for any s > 0, and the frozen factor is PD), so
+        # skip the Σa solve that the generic path would do per site
+        _rank1_update!(st, a, δq, δr)
+        return (δq, δr)
+    end
+    Sa = Σa(st, a)
+    apply_site!(st, a, δq, δr, Sa, dot(a, Sa); rmax=rmax)
+end
+
+function apply_site!(st::SparseState, a::AV, δq::Real, δr::Real, Sa, s::Float64; rmax::Float64=1e12) where AV<:AbstractVector
+    isfinite(δq) || (δq = 0.0)
+    isfinite(δr) || (δr = 0.0)
+    if !(s > 0) || !isfinite(s)
+        return nothing
+    end
+    if δq < 0 && getfield(st, :frozen) && !getfield(st, :approx_check)
+        # Downdate inside a frozen sweep: the K check below would use the
+        # sweep-start s, and a sum of individually-PD downdates can lose PD
+        # (Ising sites are pure downdates) — refactor now and check against
+        # the current Q. Updates with δq ≥ 0 are always PD-safe (adding a
+        # PSD rank-1 to a PD matrix), so they never trigger this.
+        thaw!(st)
+        Sa = Σa(st, a); s = dot(a, Sa)
+        freeze!(st)
+        (s > 0 && isfinite(s)) || return nothing
+    end
+    K = 1 + s*δq
+    while (K <= 0 || abs(δr) > rmax) && (abs(δq) > 1e-14 || abs(δr) > rmax)
+        δq /= 2
+        δr /= 2
+        K = 1 + s*δq
+    end
+    (K > 0 && abs(δr) <= rmax) || return nothing
+    _rank1_update!(st, a, δq, δr)      # sparse rank-1 update of Q
+    return (δq, δr)
+end
+
+# rank-d apply (sparse A, e.g. gas pairwise sites): same pre-check, accumulate
+function apply_site!(st::SparseState, A::AM, δQ::DQM, δr::DRV; rmax::Float64=1e12) where {AM<:AbstractMatrix, DQM<:AbstractMatrix, DRV<:AbstractVector}
+    ensure_fresh!(st)
+    SA = st.F \ A'                       # Σ A' (sparse)
+    SAA = A * SA
+    δQc = copy(δQ); δrc = copy(δr)
+    all(isfinite, δQc) || fill!(δQc, zero(eltype(δQc)))
+    all(isfinite, δrc) || fill!(δrc, zero(eltype(δrc)))
+    K = I + SAA * δQc
+    while (!isposdef(Symmetric(Matrix(K))) || maximum(abs.(δrc)) > rmax) &&
+          (maximum(abs.(δQc)) > 1e-14 || maximum(abs.(δrc)) > rmax)
+        δQc ./= 2
+        δrc ./= 2
+        K = I + SAA * δQc
+    end
+    (isposdef(Symmetric(Matrix(K))) && maximum(abs.(δrc)) <= rmax) || return nothing
+    As = A isa SparseMatrixCSC ? A : sparse(A)   # keep the Q update sparse
+    st.Q .+= As' * sparse(δQc) * As
+    st.r .+= As' * δrc
+    st.stale = true
     return (δQc, δrc)
 end

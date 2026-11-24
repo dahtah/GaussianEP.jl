@@ -26,8 +26,10 @@ Gaussian cavity `η ~ N(m, S)`: returns `(z, lz, μ, Σ)` with
 `z = E[f(η)]`, `lz = log z`, `μ = E[f(η)η]/z` and `Σ` the tilted covariance.
 Dispatches on the likelihood: analytic rules where available (Gaussian,
 Ising, spike-and-slab), log-space Gauss–Hermite quadrature otherwise
-(rank 1, or tensor rule for rank ≤ 3). `stein=true` uses Stein's lemma +
-autodiff for rank 1; `power=α` gives moments of `f^α` (fractional EP).
+(rank 1, or tensor rule for rank ≤ 3). For rank 2–3 a sparse grid from
+`smolyak_rule(level, d)` can be passed as `qr` — it is used as-is via
+`qr.grid` (signed Smolyak weights are handled). `stein=true` uses Stein's
+lemma + autodiff for rank 1; `power=α` gives moments of `f^α` (fractional EP).
 """
 function tilted_moments(lik::Likelihood, y, m::AbstractVector, S::AbstractMatrix, qr::QuadRule; stein::Bool=false, power::Float64=1.0)
     _tilted_quad(Val(length(m)), lik, y, m, S, qr, stein, power)
@@ -37,23 +39,50 @@ _tilted_quad(::Val{1}, lik, y, m::AbstractVector, S::AbstractMatrix, qr::QuadRul
 function _tilted_quad(::Val{d}, lik, y, m::AbstractVector, S::AbstractMatrix, qr::QuadRule, stein::Bool, power::Float64) where {d}
     d <= 3 || throw(ArgumentError("tensor quadrature supports rank ≤ 3, got rank $d; provide an analytic moment rule for this likelihood"))
     L = cholesky(Symmetric(S)).L
-    k = length(qr.x)
-    npts = k^d
-    lw = Vector{Float64}(undef, npts)
-    ηs = Vector{Vector{Float64}}(undef, npts)
-    for (n, I) in enumerate(CartesianIndices(ntuple(_ -> 1:k, d)))
-        z = [qr.x[I[j]] for j in 1:d]
-        η = m + L*z
-        ηs[n] = η
-        lw[n] = power*log_dens(lik, η, y) + sum(log(qr.w[I[j]]) for j in 1:d)
+    # qr.grid === nothing: full tensor product of the 1-D rule (x, w).
+    # qr.grid !== nothing (smolyak_rule(level, d)): explicit d×npts sparse
+    # grid with signed weights — handled with a signed log-sum-exp below.
+    sgn = qr.grid === nothing ? nothing : sign.(qr.w)
+    if qr.grid === nothing
+        k = length(qr.x)
+        npts = k^d
+        lw = Vector{Float64}(undef, npts)
+        ηs = Vector{Vector{Float64}}(undef, npts)
+        for (n, I) in enumerate(CartesianIndices(ntuple(_ -> 1:k, d)))
+            z = [qr.x[I[j]] for j in 1:d]
+            η = m + L*z
+            ηs[n] = η
+            lw[n] = power*log_dens(lik, η, y) + sum(log(qr.w[I[j]]) for j in 1:d)
+        end
+        lz = logsumexp(lw)
+    else
+        Z = qr.grid
+        size(Z, 1) == d || throw(ArgumentError("quadrature grid has $(size(Z,1)) rows but the site has rank $d"))
+        npts = size(Z, 2)
+        lw = Vector{Float64}(undef, npts)
+        ηs = Vector{Vector{Float64}}(undef, npts)
+        for n in 1:npts
+            η = m + L*view(Z, :, n)
+            ηs[n] = η
+            lw[n] = power*log_dens(lik, η, y) + qr.logw[n]   # logw = log|w|
+        end
+        # signed log-sum-exp: lz = log(Σ sgn(wₙ) exp(lwₙ)); if the signed
+        # quadrature sum is non-positive (possible with Smolyak's negative
+        # weights on hard factors) treat as degenerate → cavity moments below
+        lse = logsumexp(lw)
+        s = 0.0
+        @inbounds for n in 1:npts
+            s += sign(qr.w[n]) * exp(lw[n] - lse)
+        end
+        lz = s > 0.0 ? lse + log(s) : -Inf
     end
-    lz = logsumexp(lw)
     if !isfinite(lz)
-        # all nodes have zero weight (e.g. cavity entirely inside a hard core):
-        # no information — fall back to the cavity moments
+        # all nodes have zero weight (e.g. cavity entirely inside a hard core),
+        # or the signed sparse-grid sum cancelled: no information — fall back
+        # to the cavity moments
         return (z=0.0, lz=-Inf, μ=copy(m), Σ=Symmetric(S))
     end
-    a = exp.(lw .- lz)
+    a = sgn === nothing ? exp.(lw .- lz) : sgn .* exp.(lw .- lz)
     if maximum(a) >= 1 - 1e-12
         # degenerate quadrature: a single node carries all the weight — no
         # information; return the cavity moments (=> dQ = dr = 0) instead of a
@@ -61,11 +90,11 @@ function _tilted_quad(::Val{d}, lik, y, m::AbstractVector, S::AbstractMatrix, qr
         return (z=exp(lz), lz=lz, μ=copy(m), Σ=Symmetric(S))
     end
     μ = zeros(d)
-    for n in 1:npts
+    for n in 1:length(ηs)
         μ .+= a[n] * ηs[n]
     end
     Σ = zeros(d, d)
-    for n in 1:npts
+    for n in 1:length(ηs)
         δ = ηs[n] .- μ
         Σ .+= a[n] * (δ * δ')
     end
@@ -77,6 +106,7 @@ end
 # whose declared return type is abstract even though the scalar API returns
 # Float64 at runtime — without the annotation the Any leaks into site_update.
 function _tilted_moments_1d(lik::Likelihood, y, m1::Real, s2::Real, qr::QuadRule, stein::Bool, power::Float64)::NamedTuple{(:z, :lz, :μ, :Σ), Tuple{Float64, Float64, Vector{Float64}, Matrix{Float64}}}
+    qr.grid === nothing || throw(ArgumentError("sparse-grid rule (smolyak_rule(level, d≥2)) used on a rank-1 site; use smolyak_rule(level, 1) for rank-1 sites"))
     lz, μ, σ2 = _tm1_scalar(lik, y, m1, s2, qr, stein, power)
     (z=exp(lz), lz=lz, μ=[μ], Σ=reshape([σ2], 1, 1))
 end
@@ -198,9 +228,51 @@ end
 
 _tm1_analytic(lik, y, m1, s2, power) = nothing   # → quadrature fallback
 
+# Fixed-node quadrature with exact Gaussian reweighting (augmented-EP scheme,
+# see status.md / sparse_backends.md): the nodes are placed once at the
+# reference marginal g = N(m_g, s_g) and each sweep reweights by
+# r(η) = c(η)/g(η), c = N(m_c, s_c) the current cavity — exact identity
+# E_c[f] = E_g[(c/g) f]. Returns (lz, μ, σ2, ess) with ess = 1/Σa² the effective
+# sample size of the reweighted nodes (drift detector: ess drops as the cavity
+# drifts from g, especially in variance).
+function _tm1_scalar_reweight(lik::Likelihood, y, m_c::Real, s_c::Real, qr::QuadRule, m_g::Real, s_g::Real, power::Float64)
+    sqg = sqrt(s_g)
+    lz = -Inf
+    @inbounds for j in eachindex(qr.x)
+        η = sqg*qr.x[j] + m_g
+        lr = -0.5*log(s_c/s_g) - (η-m_c)^2/(2*s_c) + (η-m_g)^2/(2*s_g)
+        lz = logaddexp(lz, power*log_dens(lik, η, y) + qr.logw[j] + lr)
+    end
+    if !isfinite(lz)
+        return (-Inf, m_c, s_c, 0.0)
+    end
+    μ = 0.0; m2 = 0.0; sa = 0.0
+    @inbounds for j in eachindex(qr.x)
+        η = sqg*qr.x[j] + m_g
+        lr = -0.5*log(s_c/s_g) - (η-m_c)^2/(2*s_c) + (η-m_g)^2/(2*s_g)
+        a = exp(power*log_dens(lik, η, y) + qr.logw[j] + lr - lz)
+        μ += a*η; m2 += a*η*η; sa += a*a
+    end
+    ess = 1/sa
+    σ2raw = m2 - μ^2
+    if !(σ2raw > 1e-11)
+        return (lz, m_c, s_c, ess)   # degenerate: no information, cavity moments
+    end
+    (lz, μ, max(σ2raw, 1e-12), ess)
+end
+
+# dispatcher: analytic rule when available (ess = NaN), else reweighting quadrature
+function _tilted_moments_scalar_rw(lik::Likelihood, y, m_c::Real, s_c::Real, qr::QuadRule, m_g::Real, s_g::Real, power::Float64)
+    qr.grid === nothing || throw(ArgumentError("sparse-grid rule (smolyak_rule(level, d≥2)) used on a rank-1 site; use smolyak_rule(level, 1) for rank-1 sites"))
+    a = _tm1_analytic(lik, y, m_c, s_c, power)
+    a !== nothing && return (a[1], a[2], a[3], NaN)
+    _tm1_scalar_reweight(lik, y, m_c, s_c, qr, m_g, s_g, power)
+end
+
 # scalar dispatcher mirroring `tilted_moments` for rank-1 sites:
 # analytic rule when available, quadrature core otherwise. Returns (lz, μ, σ2).
 function _tilted_moments_scalar(lik::Likelihood, y, m1::Real, s2::Real, qr::QuadRule, stein::Bool, power::Float64)
+    qr.grid === nothing || throw(ArgumentError("sparse-grid rule (smolyak_rule(level, d≥2)) used on a rank-1 site; use smolyak_rule(level, 1) for rank-1 sites"))
     a = _tm1_analytic(lik, y, m1, s2, power)
     a !== nothing && return a
     _tm1_scalar(lik, y, m1, s2, qr, stein, power)

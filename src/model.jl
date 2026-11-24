@@ -78,6 +78,38 @@ function _unit_row(i, m)
     reshape(e, 1, m)
 end
 
+
+"""
+    gmrf_model(Q0, y, lik)
+
+GMRF with unary observations: latent field x ∈ R^p with Gaussian prior
+N(0, Q0⁻¹) (`Q0` sparse, e.g. a graph Laplacian plus a ridge) and one rank-1
+site per grid point, `A_i = e_i'` (sparse), `f_i(η) = exp(log_dens(lik, η, y_i))`.
+Uses the `SparseState` backend by default (`backend=:auto` on `ep`).
+"""
+function gmrf_model(Q0::AbstractMatrix, y::AbstractVector, lik)
+    p = size(Q0, 1)
+    length(y) == p || throw(DimensionMismatch("length(y) must equal size(Q0,1)"))
+    sites = [Site(_sparse_unit_row(i, p), y[i], lik) for i in 1:p]
+    EPModel(Q0, sites)
+end
+
+_sparse_unit_row(i, p) = sparse([1], [i], [1.0], 1, p)
+
+"""
+    gmrf_1d(y, lik=Logit(); ρ=1.0)
+
+1D GMRF: prior precision `Q0 = ρ·L + I` with `L` the 1D finite-difference
+Laplacian (tridiagonal: diag 2, off-diag −1) and unary sites `e_i'` — the
+sparse analog of GP classification with an exponential (Matérn-1/2) kernel,
+with observations `y_i ~ lik(x_i)` (e.g. `Logit()` for binary labels).
+"""
+function gmrf_1d(y::AbstractVector, lik=Logit(); ρ::Real=1.0)
+    p = length(y)
+    L = spdiagm(-1 => -ones(p-1), 0 => 2.0 .* ones(p), 1 => -ones(p-1))
+    gmrf_model(sparse(ρ .* L + I), y, lik)
+end
+
 # Gas model: p(x) ∝ exp(-β Σ_{i<j} H(||x_i - x_j||) - Σ_i V(x_i)), x ∈ R^{np*d}.
 # Pairwise sites have A_ij = [.. I_d .. -I_d ..] (rank d); unary confining
 # sites have A_i = [.. I_d ..].
