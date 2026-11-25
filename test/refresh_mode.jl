@@ -50,3 +50,39 @@ end
     @test abs(log_ml(Gc) - log_ml(Gd)) < 0.5
     @test maximum(abs.(mean(Gc) .- mean(Gd))) < 0.5
 end
+
+@testset "mini-batch (batch=B) mode: stability where full Jacobi fails" begin
+    # logistic GLM where full parallel (Jacobi) needs heavy damping but
+    # mini-batch at damp=1.0 converges to the sequential fixed point
+    rng = MersenneTwister(13)
+    n, p = 100, 20
+    X = randn(rng, n, p)
+    β = randn(rng, p)
+    y = rand(rng, n) .< 1 ./ (1 .+ exp.(-(X * β)))
+    M = glm_model(X, y, Logit())
+    Gd = ep(M; backend=:dense, maxcycles=2000, tol=1e-11)
+    @test Gd.lastδ < 1e-8
+    for B in (8, 16, 32)
+        Gb = ep(M; backend=:dense, batch=B, maxcycles=2000, tol=1e-11, damp=1.0)
+        @test Gb.lastδ < 1e-8                       # converges at damp=1.0
+        @test abs(log_ml(Gb) - log_ml(Gd)) < 1e-6   # same fixed point as sequential
+        @test maximum(abs.(mean(Gb) .- mean(Gd))) < 1e-4
+    end
+    # B = n recovers full Jacobi; B = 1 recovers sequential
+    Gj = ep(M; backend=:dense, batch=n, maxcycles=50, tol=1e-11, damp=0.2)
+    Gp = ep(M; backend=:dense, parallel=true, maxcycles=50, tol=1e-11, damp=0.2)
+    @test abs(log_ml(Gj) - log_ml(Gp)) < 1e-10
+    G1 = ep(M; backend=:dense, batch=1, maxcycles=2000, tol=1e-11, damp=1.0)
+    @test abs(log_ml(G1) - log_ml(Gd)) < 1e-10
+    @test G1.lastδ < 1e-8
+    # sparse GMRF: mini-batch converges and matches dense sequential
+    rng = MersenneTwister(7)
+    p = 200
+    xtrue = 0.4 .* cumsum(randn(rng, p))
+    y = rand(rng, p) .< 1 ./ (1 .+ exp.(-xtrue))
+    M = gmrf_1d(y, Logit(); ρ=1.0)
+    Gd = ep(M; backend=:dense, maxcycles=100, tol=1e-8)
+    Gb = ep(M; backend=:sparse, batch=64, maxcycles=100, tol=1e-8, damp=0.5)
+    @test Gb.lastδ < 1e-6
+    @test abs(log_ml(Gb) - log_ml(Gd)) < 1e-4
+end

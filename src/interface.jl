@@ -175,45 +175,30 @@ function _autotune_tau(S,τ0,τ1;nsteps=10,maxcycles=24,tol=1e-3,qr=S.qr)
 end
 
 # ---------------------------------------------------------------------------
-# Log-density of the EP approximation at a point (status.md TODO: convenience
-# function for mode-finding with Optim.jl). The EP approximation is
-#   q(x) = N(x; μ, Σ) ∏ᵢ fᵢ(Aᵢx) / tᵢ(Aᵢx),
-# with tᵢ(η) = exp(-½ η'Qᵢη + rᵢ'η) the Gaussian site factor with the stored
-# site parameters (G.Qi[i], G.ri[i]), so
-#   log q(x) = log N(x; μ, Σ) + Σᵢ [log_dens(likᵢ, Aᵢx, yᵢ) + ½ (Aᵢx)'Qᵢ(Aᵢx) - rᵢ'(Aᵢx)]
-# (up to an additive constant — the site factors tᵢ are unnormalized). The
-# Gaussian part is evaluated in natural form, -½(x-μ)'Q(x-μ) - ½logdet Q -
-# (m/2)log 2π, so it works for every state backend (a sparse Q stays sparse).
-# ForwardDiff-compatible: x may carry duals, so
-# ForwardDiff.gradient(x -> logdensity(G, x), x0) gives the gradient.
+# Log-density of the MODEL (the target EP approximates), not of the EP
+# approximation. The model is
+#   p(x) ∝ exp(-.5 x'Q0 x + r0'x) ∏ᵢ fᵢ(Aᵢx),   fᵢ(η) = exp(log_dens(likᵢ, η, yᵢ)),
+# so, up to an additive constant,
+#   log p(x) = -.5 x'Q0 x + r0'x + Σᵢ log_dens(likᵢ, Aᵢx, yᵢ).
+# Q0 keeps its own type (Matrix / Diagonal / SparseMatrixCSC), so a sparse
+# prior precision is not densified. ForwardDiff-compatible: x may carry
+# duals, so ForwardDiff.gradient(x -> logdensity(M, x), x0) works.
 # ---------------------------------------------------------------------------
 """
-    logdensity(G::EPApprox, x::AbstractVector)
+    logdensity(M::EPModel, x::AbstractVector)
 
-Log-density of the EP approximation at `x`, up to an additive constant:
-`q(x) = N(x; μ, Σ) ∏ᵢ fᵢ(Aᵢx)/tᵢ(Aᵢx)` with `tᵢ(η) = exp(-½ η'Qᵢη + rᵢ'η)` the
-Gaussian site factor (`G.Qi[i]`, `G.ri[i]`), i.e.
-`log q(x) = log N(x; μ, Σ) + Σᵢ (log_dens(likᵢ, Aᵢx, yᵢ) + ½ (Aᵢx)'Qᵢ(Aᵢx) - rᵢ'(Aᵢx))`.
-Convenience function for e.g. finding the mode with Optim.jl
-(`optimize(x -> -logdensity(G, x), mean(G))`); `x` may carry ForwardDiff
-duals, so `ForwardDiff.gradient(x -> logdensity(G, x), x0)` works.
+Log-density of the model at `x`, up to an additive constant:
+`p(x) ∝ exp(-.5 x'Q0 x + r0'x) ∏ᵢ fᵢ(Aᵢx)` with `fᵢ(η) = exp(log_dens(likᵢ, η, yᵢ))`,
+i.e. `log p(x) = -.5 x'Q0 x + r0'x + Σᵢ log_dens(likᵢ, Aᵢx, yᵢ)`.
+`Q0` keeps its own type, so sparse/diagonal prior precisions stay sparse.
+`x` may carry ForwardDiff duals, so `ForwardDiff.gradient(x -> logdensity(M, x), x0)`
+works.
 """
-function logdensity(G::EPApprox, x::AbstractVector)
-    st = G.state
-    m = dim(G)
-    dx = x .- G.μ
-    lq = -0.5 * dot(dx, G.Q * dx) - 0.5 * logdet(st) - 0.5 * m * log(2π)
-    for i in 1:nsites(G)
-        s = G.model.sites[i]
-        Qi = G.Qi[i]
-        ri = G.ri[i]
-        if size(s.A, 1) == 1
-            η = (s.A * x)[1]              # scalar η = A x (rank-1 site)
-            lq += log_dens(s.lik, η, s.y) + 0.5 * Qi[1, 1] * η^2 - ri[1] * η
-        else
-            η = s.A * x
-            lq += log_dens(s.lik, η, s.y) + 0.5 * dot(η, Qi * η) - dot(ri, η)
-        end
+function logdensity(M::EPModel, x::AbstractVector)
+    lq = -0.5 * dot(x, M.Q0 * x) + dot(M.r0, x)
+    for s in M.sites
+        η = size(s.A, 1) == 1 ? (s.A * x)[1] : s.A * x   # scalar η for rank-1 sites
+        lq += log_dens(s.lik, η, s.y)
     end
     return lq
 end

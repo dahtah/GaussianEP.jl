@@ -15,6 +15,7 @@ mutable struct EPWorkspace{T}
     marg_m :: Vector{T}   # cached per-site marginals m_i = a_i'μ (refresh mode)
     marg_s :: Vector{T}   # cached per-site marginal variances s_i = a_i'Σa_i
     marg_ess :: Vector{T} # per-site ESS of the reweighted quadrature (drift detector)
+    sd :: Vector{T}       # posterior std devs sqrt(diag Σ), for crit=:rel (refreshed at syncs)
     cache_on :: Bool      # true while the marginal cache is in use
     ups :: Vector{NamedTuple{(:δq, :δr, :lz, :δs, :sa2), Tuple{T,T,T,T,T}}}  # per-site proposals (threaded cache sweep)
 end
@@ -59,7 +60,8 @@ dim(G::EPApprox) = dim(G.state)
 nsites(G::EPApprox) = nsites(G.model)
 
 function Base.show(io::IO, G::EPApprox)
-    print(io, "EPApprox in dim $(dim(G)) with $(nsites(G)) sites, state $(typeof(G.state))")
+    print(io, "EPApprox in dim $(dim(G)) with $(nsites(G)) sites, lastδ=$(G.lastδ), state: ")
+    show(io, G.state)   # compact one-line show of the state backend (src/state.jl)
 end
 
 # project a symmetric matrix onto the PSD cone
@@ -105,7 +107,7 @@ function EPApprox(M::EPModel; qr=QuadRule(20), T=Float64, stein::Bool=false, pow
     # (dispatch on the runtime type), so apply_site!/Σa are static and the
     # per-site init does not box through the abstract AbstractEPState field
     # (perf_alloc.md §3)
-    ws = EPWorkspace{T}(zeros(T, dim(st)), zeros(T, dim(st)), zeros(T, n), zeros(T, n), zeros(T, n), false, [(δq=zero(T), δr=zero(T), lz=zero(T), δs=zero(T), sa2=zero(T)) for _ in 1:n])
+    ws = EPWorkspace{T}(zeros(T, dim(st)), zeros(T, dim(st)), zeros(T, n), zeros(T, n), zeros(T, n), ones(T, dim(st)), false, [(δq=zero(T), δr=zero(T), lz=zero(T), δs=zero(T), sa2=zero(T)) for _ in 1:n])
     # SparseState: freeze the factor for the whole init — one refactorization
     # instead of one per site (each rank-1 update marks the factor stale, and
     # ensure_fresh! would refactor per site otherwise: O(n) refactors, the
@@ -465,26 +467,29 @@ function update_site!(G::EPApprox, i, dQ, dr, lz, α=1.0, power::Float64=1.0)
 end
 
 """
-    fit!(G::EPApprox; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0,
+    fit!(G::EPApprox; qr=QuadRule(20), maxcycles=50, tol=1e-6, damp=1.0,
          stein=false, parallel=false, power=1.0, resync=10, robust=false,
-         robust_tol=1e-6)
+         robust_tol=1e-6, verbose=true)
 
 Run expectation propagation on `G` in place until convergence (or
 `maxcycles`), and return `G`. Same keyword semantics as [`ep`](@ref):
 `damp` ∈ (0,1] damps the site updates, `parallel=true` uses damped Jacobi
-(parallel) updates, `stein=true` uses Stein/autodiff moments for rank-1
+(parallel) updates — equivalent to `batch=n` (full mini-batch), `stein=true`
+uses Stein/autodiff moments for rank-1
 sites, `power=α` is fractional EP (target unchanged), `resync` is how often
 (in cycles) the state is resynced from `Q` (Woodbury drift), `robust=true`
 auto-switches a site to the trapezoid rule when `moment_disagreement` flags
 its cavity. Convergence is measured on both the mean and the site natural
-parameters.
+parameters. `verbose=true` (default) prints a one-line convergence summary
+(cycles run, final δ, tol, crit, sweep mode) after the loop; the
+non-convergence warning is always printed, regardless of `verbose`.
 """
-function fit!(G::EPApprox; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:strict, refresh::Int=1, ess_min::Float64=0.0)
+function fit!(G::EPApprox; qr=QuadRule(20), maxcycles=50, tol=1e-6, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:rel, refresh::Int=1, ess_min::Float64=0.0, batch::Int=0, verbose::Bool=true)
     # function barrier on the concrete state type: ONE dynamic dispatch per
     # fit! call instead of one per site — inside _fit_impl! the state local is
     # statically typed, so the hot path allocates nothing per site
     # (perf_alloc.md §3)
-    return _fit_impl!(G, G.state; qr=qr, maxcycles=maxcycles, tol=tol, damp=damp, stein=stein, parallel=parallel, power=power, resync=resync, robust=robust, robust_tol=robust_tol, crit=crit, refresh=refresh, ess_min=ess_min)
+    return _fit_impl!(G, G.state; qr=qr, maxcycles=maxcycles, tol=tol, damp=damp, stein=stein, parallel=parallel, power=power, resync=resync, robust=robust, robust_tol=robust_tol, crit=crit, refresh=refresh, ess_min=ess_min, batch=batch, verbose=verbose)
 end
 
 # Fill the per-site marginal cache (m_i, s_i) = (a_i'μ, a_i'Σa_i) from the
@@ -576,10 +581,11 @@ function _rebuild_state_from_sites!(st::CholeskyState, G::EPApprox, avs)
     return st
 end
 
-function _fit_impl!(G::EPApprox, st::ST; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:strict, refresh::Int=1, ess_min::Float64=0.0) where {ST<:AbstractEPState}
+function _fit_impl!(G::EPApprox, st::ST; qr=QuadRule(20), maxcycles=50, tol=1e-6, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:rel, refresh::Int=1, ess_min::Float64=0.0, batch::Int=0, verbose::Bool=true) where {ST<:AbstractEPState}
     ws = G.ws
     m = copy(st.μ)
     δ = Inf
+    ncycles = 0                       # actual cycles executed (≤ maxcycles)
     n = nsites(G)
     # Precompute the site row views once per fit! when all sites are rank-1
     # with a uniform A type (concrete eltype) — avoids a ~96 B view allocation
@@ -597,9 +603,29 @@ function _fit_impl!(G::EPApprox, st::ST; qr=QuadRule(20), maxcycles=50, tol=1e-8
     # work is O(1) + quadrature with NO solves/matvecs. SparseState freezes its
     # factor and keeps updating the sparse Q per site; dense/cholesky DEFER
     # the state update and rebuild (Q, r) from the sites at each refresh.
+    # Sweep-mode normalization — there is a single block-sweep engine
+    # parameterized by the batch size B: batch=1 is exactly sequential
+    # Gauss-Seidel (routed to the fused sequential hot path, no per-batch
+    # threading or refactor overhead), and parallel=true is exactly full
+    # Jacobi, i.e. B = n (kept as a flag for backward compatibility). The
+    # cached-marginal mode is a property of full sweeps (B = n): only then
+    # are all proposals computed against the same state, so the per-site
+    # marginals can be cached and refreshed every `refresh` cycles.
+    if batch == 1
+        batch = 0
+        parallel = false
+    elseif parallel && batch == 0
+        batch = n
+    end
+    parallel = batch >= n
     use_cache = parallel && (st isa SparseState || st isa DenseState || st isa CholeskyState) && avs !== nothing && power == 1.0
     ws.cache_on = use_cache
     force_refresh = true
+    if crit === :rel
+        # posterior sd scale for the relative criterion; ws.sd starts at ones
+        # so a failed refresh degrades gracefully to the absolute criterion
+        _post_sd!(ws.sd, st) || (sync!(st); _post_sd!(ws.sd, st))
+    end
     for c in 1:maxcycles
         # Woodbury updates drift: resync Σ = Q⁻¹, μ = Σr, logdetQ from Q every
         # `resync` cycles (and once at the end) instead of re-inverting every
@@ -611,7 +637,7 @@ function _fit_impl!(G::EPApprox, st::ST; qr=QuadRule(20), maxcycles=50, tol=1e-8
         # backend). With refresh > 1 the factor and marginals stay frozen for
         # `refresh` sweeps (drift accepted, quadrature reweights exactly).
         refresh_now = use_cache && (force_refresh || (c - 1) % refresh == 0)
-        if parallel && st isa SparseState
+        if use_cache && st isa SparseState
             if refresh_now || !getfield(st, :frozen)
                 thaw!(st); sync!(st)               # fresh factor (refactor if stale)
                 if use_cache
@@ -629,6 +655,7 @@ function _fit_impl!(G::EPApprox, st::ST; qr=QuadRule(20), maxcycles=50, tol=1e-8
         elseif !use_cache && c % resync == 0
             sync!(st)
         end
+        crit === :rel && _post_sd!(ws.sd, st)   # sparse: no-op while stale/frozen
         δsite = 0.0
         if use_cache
             # frozen-factor sweep over the cached marginals: per-site work is
@@ -645,17 +672,45 @@ function _fit_impl!(G::EPApprox, st::ST; qr=QuadRule(20), maxcycles=50, tol=1e-8
                 δsite = max(δsite, u[4])
                 _hot1d_apply!(G, i, avs[i], st, u[1], u[2], u[3], u[5], true)
             end
-        elseif parallel
-            # Jacobi-style: all site updates computed against the same state
-            # (embarrassingly parallel), then applied with damping
-            ups = Vector{NamedTuple{(:dQ, :dr, :lz)}}(undef, n)
-            Threads.@threads for i in 1:n
-                ups[i] = site_update(G, i, qr, stein=stein, power=power, robust=robust, robust_tol=robust_tol)
+        elseif batch > 0
+            # mini-batch (block Gauss-Seidel): sites split into batches of
+            # size B = min(batch, n); each batch's proposals are computed in
+            # parallel against the CURRENT state and applied serially, so
+            # later batches see earlier batches' updates. B = n recovers full
+            # Jacobi, B = 1 sequential. SparseState refactors once per batch
+            # (freeze for the batch, thaw after). Fixes the stability of full
+            # Jacobi on GLMs (minibatch.md): B ~ sqrt(n)..n/8 at damp=1
+            # converges where Jacobi does not, to the same fixed point.
+            B = min(batch, n)
+            ups = Vector{NamedTuple{(:dQ, :dr, :lz)}}(undef, B)
+            for b0 in 1:B:n
+                b1 = min(b0 + B - 1, n)
+                if st isa SparseState
+                    thaw!(st); sync!(st)               # one refactor per batch
+                    st.jacobi = true; st.approx_check = true
+                    freeze!(st)
+                end
+                blen = b1 - b0 + 1
+                if blen >= 2 * Threads.nthreads()
+                    Threads.@threads for k in 1:blen
+                        ups[k] = site_update(G, b0 + k - 1, qr, stein=stein, power=power, robust=robust, robust_tol=robust_tol)
+                    end
+                else
+                    # small batch: serial compute, threading overhead dominates
+                    for k in 1:blen
+                        ups[k] = site_update(G, b0 + k - 1, qr, stein=stein, power=power, robust=robust, robust_tol=robust_tol)
+                    end
+                end
+                for k in 1:(b1 - b0 + 1)
+                    i = b0 + k - 1
+                    δsite = max(δsite, maximum(abs.(ups[k].dQ .- power .* G.Qi[i])), maximum(abs.(ups[k].dr .- power .* G.ri[i])))
+                    update_site!(G, i, ups[k].dQ, ups[k].dr, ups[k].lz, damp, power)
+                end
+                if st isa SparseState
+                    thaw!(st); st.jacobi = false; st.approx_check = false
+                end
             end
-            for i in 1:n
-                δsite = max(δsite, maximum(abs.(ups[i].dQ .- power .* G.Qi[i])), maximum(abs.(ups[i].dr .- power .* G.ri[i])))
-                update_site!(G, i, ups[i].dQ, ups[i].dr, ups[i].lz, damp, power)
-            end
+            st isa SparseState && sync!(st)   # fold the sweep in for the δ check
         else
             for i in 1:n
                 if size(G.model.sites[i].A, 1) == 1 && power == 1.0
@@ -690,10 +745,21 @@ function _fit_impl!(G::EPApprox, st::ST; qr=QuadRule(20), maxcycles=50, tol=1e-8
             sum(abs, dμ) / length(dμ)
         elseif crit === :max
             maximum(abs, dμ)
+        elseif crit === :rel
+            # scale-free: max_i |Δμ_i| / posterior sd_i — the mean has
+            # stabilised to a fraction `tol` of the posterior std dev
+            δμ = 0.0
+            @inbounds for i in eachindex(dμ)
+                δμ = max(δμ, abs(dμ[i]) / ws.sd[i])
+            end
+            # in cached-marginal mode st.μ is stale between refreshes (Δμ = 0),
+            # so the site-param change is the only convergence signal there
+            use_cache ? max(δμ, δsite) : δμ
         else
             max(maximum(abs, dμ), δsite)
         end
         force_refresh = use_cache && ess_min > 0 && minimum(ws.marg_ess) < ess_min
+        ncycles = c                   # count the cycle just executed
         δ < tol && break
         m .= st.μ
     end
@@ -704,33 +770,58 @@ function _fit_impl!(G::EPApprox, st::ST; qr=QuadRule(20), maxcycles=50, tol=1e-8
     ws.cache_on = false
     sync!(st)
     G.lastδ = δ
+    # one-line convergence summary (gated on `verbose`); the non-convergence
+    # warning below is ALWAYS printed, independent of `verbose`
+    mode = parallel ? (use_cache ? "parallel Jacobi (batch=$n), cache refresh=$refresh" :
+                                   "parallel Jacobi (batch=$n)") :
+           batch > 0 ? "batch=$batch" : "sequential"
+    if verbose
+        @info "EP fit: cycles=$ncycles, δ=$(round(G.lastδ, sigdigits=3)), tol=$tol, crit=$crit, mode=$mode, converged=$(δ < tol)"
+    end
     δ < tol || @info "EP did not reach tolerance (δ=$δ); consider damping or more quadrature nodes"
     return G
 end
 
 """
-    ep(M::EPModel; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0,
+    ep(M::EPModel; qr=QuadRule(20), maxcycles=50, tol=1e-6, damp=1.0,
        stein=false, parallel=false, power=1.0, resync=10, robust=false,
-       robust_tol=1e-6, crit=:strict)
+       robust_tol=1e-6, crit=:rel)
 
 Run expectation propagation on `M` until convergence and return the
 `EPApprox`. `damp` ∈ (0,1] damps the site updates, `parallel=true` uses
-damped Jacobi (parallel) updates, `stein=true` uses Stein/autodiff moments
+damped Jacobi (parallel) updates — equivalent to `batch=n`, `stein=true`
+uses Stein/autodiff moments
 for rank-1 sites, `power=α` is fractional EP (target unchanged), `resync`
 is how often (in cycles) the state is resynced from `Q` (Woodbury drift).
 `robust=true` re-computes rank-1 tilted moments with the trapezoid rule
 (`trap_rule`) whenever `moment_disagreement` against `qr` exceeds
 `robust_tol` — the robust integration mode for kinked/bounded factors
 (status.md; `test/quadrature.jl`). `crit` selects the convergence criterion:
-`:strict` (default) = max|Δμ| and max site-param change, `:max` = max|Δμ|,
-`:mean` = mean|Δμ| (the legacy `ep_glm` criterion, perf_gap.md §1).
+`:rel` (default) = maxᵢ |Δμᵢ|/sqrt(Σᵢᵢ) (scale-free), `:strict` = max|Δμ| and max site-param change, `:max` = max|Δμ|,
+`:mean` = mean|Δμ| (the legacy `ep_glm` criterion, perf_gap.md §1),
+`:rel` = maxᵢ |Δμᵢ| / sqrt(Σᵢᵢ) — scale-free: the mean has stabilised to a
+fraction `tol` of the posterior std dev (the posterior sd is refreshed from
+the state at each sync; O(p) dense, O(p²) Cholesky recurrence, O(p·nnz L) at
+sync points for sparse). Note the mean alone can be stationary in symmetric
+models — use `:strict` there.
 `backend=:dense` (default) uses the Woodbury `DenseState`; `backend=:cholesky`
 uses `CholeskyState` — exact rank-1 `lowrankupdate!`/`lowrankdowndate!` on the
 Cholesky factor of Q, no Woodbury drift (`src/state.jl`).
+`batch=B` (default 0 = off) uses mini-batch (block Gauss-Seidel) sweeps: sites
+are split into batches of size `B`, each batch's proposals are computed in
+parallel against the current state and applied serially before the next batch
+(B = n is full Jacobi — the same as `parallel=true`, B = 1 is sequential).
+Mini-batch converges reliably on GLMs where full Jacobi does not (minibatch.md);
+`refresh`/`ess_min` (cached-marginal mode) apply only to full sweeps
+(`batch = n` / `parallel=true`) and are disabled when `0 < batch < n`.
+`verbose=true` (default) prints a one-line
+convergence summary (cycles run, final δ, tol, crit, sweep mode) after the
+loop; `verbose=false` silences it (the non-convergence warning is always
+printed).
 """
-function ep(M::EPModel; qr=QuadRule(20), maxcycles=50, tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:strict, backend::Symbol=:auto, refresh::Int=1, ess_min::Float64=0.0)
+function ep(M::EPModel; qr=QuadRule(20), maxcycles=50, tol=1e-6, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:rel, backend::Symbol=:auto, refresh::Int=1, ess_min::Float64=0.0, batch::Int=0, verbose::Bool=true)
     G = EPApprox(M, qr=qr, stein=stein, power=power, backend=backend)
-    fit!(G, qr=qr, maxcycles=maxcycles, tol=tol, damp=damp, stein=stein, parallel=parallel, power=power, resync=resync, robust=robust, robust_tol=robust_tol, crit=crit, refresh=refresh, ess_min=ess_min)
+    fit!(G, qr=qr, maxcycles=maxcycles, tol=tol, damp=damp, stein=stein, parallel=parallel, power=power, resync=resync, robust=robust, robust_tol=robust_tol, crit=crit, refresh=refresh, ess_min=ess_min, batch=batch, verbose=verbose)
 end
 
 """

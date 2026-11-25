@@ -91,6 +91,28 @@ quadform(st::DenseState) = dot(st.r, st.μ)          # r'Σr = r'μ
 logZ(st::DenseState) = 0.5*(length(st.r)*log(2π) - st.logdetQ + quadform(st))
 dim(st::DenseState) = size(st.Q, 1)
 
+# cheap O(p²) drift indicator for show: max_j |(ΣQ)_{jj} − 1|. The exact
+# drift(st) below needs an O(p³) inversion of Q — too expensive for show.
+function _show_drift(st::DenseState)
+    p = size(st.Q, 1)
+    d = 0.0
+    @inbounds for j in 1:p
+        d = max(d, abs(dot(view(st.Σ, j, :), view(st.Q, :, j)) - 1))
+    end
+    return d
+end
+
+# compact one-line show — all fields are plain (no getproperty override on
+# DenseState), no factorization/inversion
+function Base.show(io::IO, st::DenseState)
+    print(io, typeof(st), ": dim=$(dim(st)), logdetQ=$(st.logdetQ), drift=$(_show_drift(st)), τ=$(st.τ)")
+end
+
+function Base.show(io::IO, ::MIME"text/plain", st::DenseState)
+    show(io, st)
+    print(io, "\n  μ: $(dim(st))-vector, ‖μ‖=$(norm(st.μ)), ‖r‖=$(norm(st.r))")
+end
+
 # inverse of a small (d×d, d ≤ 3) symmetric PD matrix, Cholesky-based with an
 # eigenvalue-clamp fallback (keeps the cavity finite if the shrink floor is hit)
 function _small_pd_inv(S::Symmetric)
@@ -266,6 +288,16 @@ function drift(st::DenseState)
     return maximum(abs.(st.Σ .- inv(Symmetric(st.Q))))
 end
 
+# posterior std devs sqrt(diag Σ) into buf, for the crit=:rel convergence
+# criterion. O(p) here — Σ is maintained explicitly.
+function _post_sd!(buf::AbstractVector, st::DenseState)
+    Σ = st.Σ
+    @inbounds for i in eachindex(buf)
+        buf[i] = sqrt(Σ[i, i])
+    end
+    return true
+end
+
 # ---------------------------------------------------------------------------
 # CholeskyState: the Cholesky factor of Q is the source of truth (no Woodbury
 # drift). Rank-1 site updates use LinearAlgebra.lowrankupdate!/lowrankdowndate!
@@ -312,6 +344,40 @@ logZ(st::CholeskyState) = 0.5*(length(st.r)*log(2π) - st.logdetQ + quadform(st)
 dim(st::CholeskyState) = length(st.r)
 Σa(st::CholeskyState, a::AbstractVector) = st.C \ a    # Q⁻¹a, two triangular solves
 drift(st::CholeskyState) = 0.0                          # factor is exact by construction
+
+# posterior std devs sqrt(diag Σ) into buf via the O(p²) recurrence for the
+# diagonal of the inverse from the Cholesky factor L (Q = L L'):
+#   d_i = (1 + Σ_{k>i} L_ki² d_k) / L_ii² ,  d = diag(Q⁻¹), bottom-up.
+# buf holds d during the sweep and is square-rooted in place at the end.
+function _post_sd!(buf::AbstractVector, st::CholeskyState)
+    L = st.C.L          # proper lower-triangular view (factors stores only one triangle)
+    p = size(L, 1)
+    @inbounds for i in p:-1:1
+        acc = 1.0
+        lii = L[i, i]
+        for k in (i+1):p
+            lki = L[k, i]
+            acc += lki * lki * buf[k]
+        end
+        buf[i] = acc / (lii * lii)
+    end
+    @inbounds for i in 1:p
+        buf[i] = sqrt(buf[i])
+    end
+    return true
+end
+
+# compact one-line show. NB: do NOT touch st.Q / st.Σ here — the getproperty
+# above materializes Q (O(p²)) resp. Σ = C⁻¹ (O(p³)); only the maintained
+# scalars/vectors are read, so show stays cheap (no factorization, no inversion)
+function Base.show(io::IO, st::CholeskyState)
+    print(io, typeof(st), ": dim=$(dim(st)), logdetQ=$(st.logdetQ), τ=$(st.τ)")
+end
+
+function Base.show(io::IO, ::MIME"text/plain", st::CholeskyState)
+    show(io, st)
+    print(io, "\n  μ: $(dim(st))-vector, ‖μ‖=$(norm(st.μ)), ‖r‖=$(norm(st.r))")
+end
 
 function reset!(st::CholeskyState, Q::AbstractMatrix, r::AbstractVector)
     st.C = cholesky(Symmetric(Matrix{Float64}(Q)))
@@ -554,6 +620,40 @@ quadform(st::SparseState) = dot(st.r, st.μ)
 logZ(st::SparseState) = 0.5*(length(st.r)*log(2π) - st.logdetQ + quadform(st))
 dim(st::SparseState) = size(st.Q, 1)
 drift(st::SparseState) = 0.0                          # factor is exact when fresh
+
+# posterior std devs sqrt(diag Σ) into buf for crit=:rel. Needs a fresh
+# factor: returns false (buffer untouched) when stale/frozen, so the caller
+# keeps the last good values. Cost O(p·nnz(L)) — only worth calling at
+# sync/refresh points, not per cycle.
+function _post_sd!(buf::AbstractVector, st::SparseState)
+    (getfield(st, :stale) || getfield(st, :frozen)) && return false
+    F = getfield(st, :F)
+    p = size(getfield(st, :Q), 1)
+    e = zeros(eltype(buf), p)
+    @inbounds for i in 1:p
+        fill!(e, 0.0)
+        e[i] = 1.0
+        buf[i] = sqrt(dot(e, F \ e))    # e_i' Q⁻¹ e_i
+    end
+    return true
+end
+
+# compact one-line show. NB: getfield-safe access — st.μ / st.logdetQ via
+# getproperty would call ensure_fresh! (a CHOLMOD refactorization when stale)
+# and st.Σ materializes a dense O(p³) inverse; neither belongs in show.
+# st.Q is the sparse matrix itself (not intercepted), read via getfield anyway.
+function Base.show(io::IO, st::SparseState)
+    Q = getfield(st, :Q)
+    print(io, typeof(st), ": dim=$(size(Q, 1)), nnz(Q)=$(nnz(Q)), logdetQ=$(getfield(st, :logdetQ)), shift=$(getfield(st, :shift)), ",
+          "flags: stale=$(getfield(st, :stale)), frozen=$(getfield(st, :frozen)), jacobi=$(getfield(st, :jacobi)), approx_check=$(getfield(st, :approx_check)), ",
+          "τ=$(getfield(st, :τ))")
+end
+
+function Base.show(io::IO, ::MIME"text/plain", st::SparseState)
+    show(io, st)
+    μ = getfield(st, :μ); r = getfield(st, :r)
+    print(io, "\n  μ: $(length(μ))-vector, ‖μ‖=$(norm(μ)), ‖r‖=$(norm(r))")
+end
 
 # Σa = Q⁻¹a via the cached factor (one sparse triangular solve pair)
 function Σa(st::SparseState, a::AbstractVector)

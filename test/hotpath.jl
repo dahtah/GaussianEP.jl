@@ -3,7 +3,7 @@
 # identical to the generic site_update/update_site! path, and the crit
 # keyword must select the convergence criterion.
 
-using Random
+using Random, Logging
 
 @testset "fused rank-1 hot path matches generic path" begin
     rng = MersenneTwister(7)
@@ -44,13 +44,46 @@ end
     Gs = ep(M; qr=QuadRule(20), tol=1e-9, crit=:strict)
     Gm = ep(M; qr=QuadRule(20), tol=1e-9, crit=:mean)
     Gx = ep(M; qr=QuadRule(20), tol=1e-9, crit=:max)
+    Gr = ep(M; qr=QuadRule(20), tol=1e-9, crit=:rel)
     # all criteria converge to the same fixed point here
     @test mean(Gs) ≈ mean(Gm) atol=1e-6
     @test mean(Gs) ≈ mean(Gx) atol=1e-6
+    @test mean(Gs) ≈ mean(Gr) atol=1e-6
     @test log_ml(Gs) ≈ log_ml(Gm) atol=1e-6
+    @test log_ml(Gs) ≈ log_ml(Gr) atol=1e-6
+    # :rel is scale-free: the cached posterior sd matches se(G) (up to the
+    # final sync! recomputing Σ exactly after the last ws.sd refresh)
+    @test Gr.ws.sd ≈ se(Gr) atol=1e-8
     # unknown crit falls back to :strict
     Gb = ep(M; qr=QuadRule(20), tol=1e-9, crit=:bogus)
     @test mean(Gb) ≈ mean(Gs) atol=1e-12
+end
+
+@testset "crit=:rel is scale-free and stops earlier" begin
+    rng = MersenneTwister(5)
+    p, n = 20, 400
+    X = randn(rng, p, n)
+    y = rand(rng, n) .> 0.5
+    M = glm_model(X, y, Logit(), 0.1)
+    # reference at very tight tolerance
+    Gref = ep(M; qr=QuadRule(20), maxcycles=200, tol=1e-12, crit=:strict, verbose=false)
+    # :rel at a loose relative tolerance: fewer cycles, still accurate
+    lg = Test.TestLogger()
+    G = Logging.with_logger(lg) do
+        ep(M; qr=QuadRule(20), maxcycles=200, tol=1e-4, crit=:rel, verbose=true)
+    end
+    cyc = parse(Int, match(r"cycles=(\d+)", String(first([l for l in lg.logs if occursin("cycles=", String(l.message))]).message)).captures[1])
+    @test cyc < 200
+    @test abs(log_ml(G) - log_ml(Gref)) < 1e-6
+    @test maximum(abs.(mean(G) .- mean(Gref)) ./ se(Gref)) < 1e-3
+    # scaling the data scales μ but not the relative criterion: same cycle count
+    M2 = glm_model(100 .* X, y, Logit(), 0.1)
+    lg2 = Test.TestLogger()
+    Logging.with_logger(lg2) do
+        ep(M2; qr=QuadRule(20), maxcycles=200, tol=1e-4, crit=:rel, verbose=true)
+    end
+    cyc2 = parse(Int, match(r"cycles=(\d+)", String(first([l for l in lg2.logs if occursin("cycles=", String(l.message))]).message)).captures[1])
+    @test cyc2 == cyc
 end
 
 @testset "logZ0 cached" begin

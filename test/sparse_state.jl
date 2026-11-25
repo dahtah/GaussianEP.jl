@@ -124,3 +124,32 @@ end
     # cache flag is reset after fit!
     @test !G8.ws.cache_on
 end
+
+@testset "scenario 3A: sparse Q0 + dense site rows (GLM with sparse prior)" begin
+    # Sparse Q0 (diagonal-as-sparse, or GMRF Laplacian) with DENSE design rows
+    # X[:,i] — the sparse+low-rank scenario of linear_algebra.md §3A. The direct
+    # path (SparseState accumulating dense rank-1 updates) is correct but
+    # densifies Q (nnz -> p^2); the (x, eta) expansion is the scalable design.
+    rng = MersenneTwister(5)
+    p, n = 60, 200
+    X = randn(rng, p, n)
+    β = 0.5 .* randn(rng, p)
+    y = rand(rng, n) .< 1 ./ (1 .+ exp.(-(X' * β)))
+    sites = [Site(reshape(X[:, i], 1, p), y[i], Logit()) for i in 1:n]
+    L = spdiagm(-1 => -ones(p - 1), 0 => 2.0 .* ones(p), 1 => -ones(p - 1))
+    for (name, Q0) in (("diag-sparse", sparse(0.01 * I, p, p)),
+                       ("grmf", sparse(L + I)))
+        M = EPModel(Q0, sites)
+        Gd = ep(M; backend=:dense, maxcycles=100, tol=1e-9, damp=0.5)
+        Gs = ep(M; backend=:auto, parallel=false, maxcycles=100, tol=1e-9, damp=0.5)
+        @test Gs.state isa GaussianEP.SparseState
+        @test abs(log_ml(Gs) - log_ml(Gd)) < 1e-8
+        @test maximum(abs.(mean(Gs) .- mean(Gd))) < 1e-6
+        # parallel refresh=1 (plain Jacobi semantics) on the GMRF prior
+        if name == "grmf"
+            Gp = ep(M; backend=:auto, parallel=true, refresh=1, maxcycles=100, tol=1e-9, damp=0.5)
+            @test abs(log_ml(Gp) - log_ml(Gd)) < 1e-6
+            @test maximum(abs.(mean(Gp) .- mean(Gd))) < 1e-4
+        end
+    end
+end
