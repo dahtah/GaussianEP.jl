@@ -135,3 +135,25 @@ end
     @test maximum(abs.(mean(G2))) > 0.05
     @test energy(mean(G2)) < energy(zeros(np-2))
 end
+
+@testset "gas log-repulsion (beta-ensemble, H=-log|r|): robust, no crash" begin
+    rng = MersenneTwister(9)
+    Hlog = r -> -log(abs(r) + 1e-300)
+    pin2 = randn(rng, 2)
+    V = (η) -> 0.5*sum(abs2, η)
+    M = gas_model(4, 2; β=1.0, H=Hlog, V=V, τ0=1e-3, pin2=pin2)
+    # standard EP converges (all damp values, several seeds)
+    G = ep(M; qr=QuadRule(30), maxcycles=300, tol=1e-8, damp=0.5, verbose=false)
+    @test G.lastδ < 1e-6
+    @test isfinite(log_ml(G))
+    @test all(isfinite, mean(G))
+    # over-relaxed power must not crash on drifted states (regression:
+    # logdet DomainError, LU SingularException, cholesky PosDefException)
+    G2 = ep(M; qr=QuadRule(30), maxcycles=50, tol=1e-8, power=2.0, verbose=false)
+    @test all(isfinite, mean(G2))
+    # kinked factor |η|^β at β=2: trapezoid rule converges where tensor GH struggles
+    M2 = gas_model(4, 2; β=2.0, H=Hlog, V=V, τ0=1e-3, pin2=pin2)
+    Gt = ep(M2; qr=trap_rule(8.0, 401), maxcycles=300, tol=1e-8, damp=0.5, verbose=false)
+    @test Gt.lastδ < 1e-6
+    @test isfinite(log_ml(Gt))
+end

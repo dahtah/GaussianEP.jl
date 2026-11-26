@@ -56,7 +56,8 @@ end
 """
     glm_regpath(X, y, lik, τ0, τ1; nsteps=10, qr=QuadRule(20), maxcycles=50,
                 tol=1e-8, damp=1.0, stein=false, parallel=false, power=1.0,
-                backend=:dense)
+                backend=:dense, batch=0, refresh=1, ess_min=0.0, crit=:rel,
+                verbose=true)
 
 Regularisation path over the prior precision τ ∈ [τ0, τ1] (log-spaced,
 `nsteps` points) for a GLM `glm_model(X, y, lik, τ)` on the new EP core.
@@ -72,6 +73,12 @@ are built for the whole path; the grid point τ is moved in place with
 `set_tau!` (`Q ← Q + (τ_new − τ_old)·Q0`, one refactorisation — no per-site
 loop, no reconstruction per grid point).
 
+The `fit!` keywords `batch`, `refresh`, `ess_min`, `crit` and `verbose` are
+accepted with the same defaults as `fit!` and forwarded to every `fit!` call
+along the path (`batch=B` runs mini-batch sweeps of size B, `refresh`/`ess_min`
+control the cached-marginal mode, `crit` selects the convergence criterion,
+`verbose=false` silences the per-fit convergence summary).
+
 Returns a named tuple:
 
 - `τs` — the grid, in **decreasing** order (τ1 first, τ0 last),
@@ -83,7 +90,9 @@ Returns a named tuple:
 """
 function glm_regpath(X, y, lik, τ0, τ1; nsteps=10, qr=QuadRule(20), maxcycles=50,
                      tol=1e-8, damp=1.0, stein::Bool=false, parallel::Bool=false,
-                     power::Float64=1.0, backend::Symbol=:dense)
+                     power::Float64=1.0, backend::Symbol=:dense,
+                     batch::Int=0, refresh::Int=1, ess_min::Float64=0.0,
+                     crit::Symbol=:rel, verbose::Bool=true)
     τs = exp.(range(log(τ1), log(τ0), nsteps))   # high-τ end first (see docstring)
     p = size(X, 1)
     μs = zeros(p, nsteps)
@@ -96,7 +105,8 @@ function glm_regpath(X, y, lik, τ0, τ1; nsteps=10, qr=QuadRule(20), maxcycles=
     for (k, τ) in enumerate(τs)
         set_tau!(G, τ)
         fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, damp=damp, stein=stein,
-             parallel=parallel, power=power)
+             parallel=parallel, power=power, batch=batch, refresh=refresh,
+             ess_min=ess_min, crit=crit, verbose=verbose)
         μs[:, k] .= mean(G)
         sds[:, k] .= se(G)
         lml[k] = log_ml(G)
@@ -115,7 +125,10 @@ Empirical-Bayes selection of the prior precision τ for a GLM on the new EP
 core: runs `glm_regpath` over [τ0, τ1] (traversed from τ1 down to τ0) and
 refits at the τ maximising the EP log marginal likelihood. Returns
 `(τ_opt, G, path)` with `G` the fitted `EPApprox` at `τ_opt` and `path` the
-full `glm_regpath` result (its `τs` in decreasing order).
+full `glm_regpath` result (its `τs` in decreasing order). `kwargs` are
+forwarded to both `glm_regpath` and the final `ep` refit (so `batch`,
+`refresh`, `ess_min`, `crit`, `verbose`, `maxcycles`, `tol`, ... are all
+understood).
 """
 function glm_autotune(X, y, lik, τ0, τ1; nsteps=10, kwargs...)
     path = glm_regpath(X, y, lik, τ0, τ1; nsteps=nsteps, kwargs...)

@@ -1,4 +1,4 @@
-using Random, Distributions
+using Random, Distributions, Logging
 # Regularisation path / autotune over the prior precision τ on the new core.
 @testset "glm_regpath / glm_autotune" begin
     Random.seed!(3)
@@ -71,4 +71,55 @@ using Random, Distributions
                         backend=:cholesky)
     @test all(isfinite, pathc.logml)
     @test maximum(abs.(pathc.logml .- path.logml)) < 1e-6
+end
+
+@testset "glm_regpath / _regpath_tau forward fit! kwargs (batch, refresh, ess_min, crit, verbose)" begin
+    Random.seed!(11)
+    p, n = 4, 60
+    X = randn(p, n)
+    y = rand(n) .< 0.5
+
+    # (a) batch=8 path runs and matches the batch=0 path at the fixed point
+    path0 = glm_regpath(X, y, Logit(), 0.01, 10.0; nsteps=4, maxcycles=100, tol=1e-10, verbose=false)
+    pathb = glm_regpath(X, y, Logit(), 0.01, 10.0; nsteps=4, maxcycles=100, tol=1e-10, batch=8, verbose=false)
+    @test maximum(abs.(pathb.logml .- path0.logml)) < 1e-6
+    @test maximum(abs.(pathb.μs .- path0.μs)) < 1e-6
+
+    # (b) the kwargs are actually forwarded to fit!: verbose=false silences the
+    # per-fit info summary; verbose=true emits exactly one per grid point, and
+    # batch / crit show up in the summary's mode / crit fields
+    lg = Test.TestLogger()
+    Logging.with_logger(lg) do
+        glm_regpath(X, y, Logit(), 0.01, 10.0; nsteps=3, maxcycles=50, tol=1e-8, verbose=false)
+    end
+    @test isempty([l for l in lg.logs if l.level >= Logging.Info])
+
+    lg = Test.TestLogger()
+    Logging.with_logger(lg) do
+        glm_regpath(X, y, Logit(), 0.01, 10.0; nsteps=3, maxcycles=50, tol=1e-8, batch=8, verbose=true)
+    end
+    infos = [l for l in lg.logs if l.level >= Logging.Info]
+    @test length(infos) == 3
+    @test all(l -> occursin("mode=batch=8", String(l.message)), infos)
+
+    lg = Test.TestLogger()
+    Logging.with_logger(lg) do
+        glm_regpath(X, y, Logit(), 0.01, 10.0; nsteps=2, maxcycles=50, tol=1e-8, crit=:max, verbose=true)
+    end
+    infos = [l for l in lg.logs if l.level >= Logging.Info]
+    @test length(infos) == 2
+    @test all(l -> occursin("crit=max", String(l.message)), infos)
+
+    # (c) crit / refresh / ess_min / verbose accepted everywhere, incl. the
+    # legacy-signature _regpath_tau and glm_autotune
+    pathc = glm_regpath(X, y, Logit(), 0.01, 10.0; nsteps=3, maxcycles=50, tol=1e-8,
+                        refresh=2, ess_min=1.0, crit=:max, verbose=false)
+    @test all(isfinite, pathc.logml)
+    S = GaussianEP.GLMSites(X, y, Logit(), QuadRule(20))
+    τs3, μs3, lz3 = GaussianEP._regpath_tau(S, 0.01, 10.0; nsteps=3, batch=8, crit=:mean, verbose=false)
+    @test issorted(τs3)
+    @test all(isfinite, lz3)
+    @test size(μs3) == (p, 3)
+    at = glm_autotune(X, y, Logit(), 0.01, 10.0; nsteps=3, maxcycles=30, tol=1e-6, batch=8, verbose=false)
+    @test isfinite(log_ml(at.G))
 end

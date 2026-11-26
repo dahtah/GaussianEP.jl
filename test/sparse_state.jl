@@ -24,7 +24,9 @@ using SparseArrays, LinearAlgebra, Random
     δq, δr = 0.7, -0.3
     applied = GaussianEP.apply_site!(st, a, δq, δr)
     @test applied == (δq, δr)
-    @test st.stale
+    # non-frozen rank-1 apply uses an in-place CHOLMOD updown: the factor stays
+    # fresh (stale == false) and matches Q exactly
+    @test !st.stale
     Q1 = Q0 + δq .* (a * a'); r1 = r0 .+ δr .* a
     @test nnz(st.Q - Q1) == 0
     @test maximum(abs.(st.r .- r1)) < 1e-14

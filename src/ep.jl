@@ -402,6 +402,12 @@ function site_update(G::EPApprox, i, qr::QuadRule; stein::Bool=false, power::Flo
     s = G.model.sites[i]
     cv = cavity(G, i, power)
     z, lzt, μt, Σt = _concrete_tm(tilted_moments(s.lik, s.y, cv.m, cv.S, qr, stein=stein, power=power))
+    if !isfinite(lzt) || !all(isfinite, μt) || !all(isfinite, Σt) || !all(isfinite, cv.m) || !all(isfinite, cv.S)
+        # degenerate quadrature / drifted state: no-op site update (dQ = dr = 0,
+        # lz = 0) instead of poisoning Q with garbage natural parameters
+        d = size(s.A, 1)
+        return (dQ=zeros(d, d), dr=zeros(d), lz=0.0)
+    end
     Qp = pd_inv(Symmetric(Σt))
     rp = Qp * μt
     Λc = pd_inv(Symmetric(cv.S))
@@ -427,6 +433,52 @@ function site_update(G::EPApprox, i, qr::QuadRule; stein::Bool=false, power::Flo
     # don't write -Inf/NaN into logz — fall back to 0 (no-op site update)
     isfinite(lz) || (lz = 0.0)
     (dQ=dQ, dr=dr, lz=lz)
+end
+
+# Apply a batch of rank-1 proposals (ups[k] for sites b0..b1) to the state.
+# DenseState + uniform rank-1 sites + blen ≥ 8: ONE fused rank-B Woodbury
+# apply (apply_sites!, O(p²) traffic on Σ/Q instead of O(B p²) for B gers),
+# with fallback to per-site update_site! (PD backtracking) when the combined
+# K is not PD. Other backends: per-site applies (CholeskyState's
+# lowrankupdate! is rank-1 only; SparseState refactors once per batch already).
+function _apply_batch!(G::EPApprox, st::DenseState, avs, b0::Int, b1::Int, ups, damp::Float64, power::Float64)
+    blen = b1 - b0 + 1
+    if avs !== nothing && blen >= 8
+        p = dim(st)
+        A = Matrix{Float64}(undef, p, blen)          # columns = site rows a_i
+        δq = Vector{Float64}(undef, blen)
+        δr = Vector{Float64}(undef, blen)
+        for k in 1:blen
+            i = b0 + k - 1
+            A[:, k] .= avs[i]
+            δq[k] = damp * (ups[k].dQ[1, 1] - power * G.Qi[i][1, 1])
+            δr[k] = damp * (ups[k].dr[1] - power * G.ri[i][1])
+        end
+        applied = apply_sites!(st, A, δq, δr)
+        if applied !== nothing
+            δqa, δra = applied
+            for k in 1:blen
+                i = b0 + k - 1
+                G.Qi[i][1, 1] += δqa[k]
+                G.ri[i][1] += δra[k]
+                G.logz[i] = ups[k].lz
+            end
+            return
+        end
+    end
+    for k in 1:blen
+        i = b0 + k - 1
+        update_site!(G, i, ups[k].dQ, ups[k].dr, ups[k].lz, damp, power)
+    end
+    return
+end
+
+function _apply_batch!(G::EPApprox, st::AbstractEPState, avs, b0::Int, b1::Int, ups, damp::Float64, power::Float64)
+    for k in 1:(b1 - b0 + 1)
+        i = b0 + k - 1
+        update_site!(G, i, ups[k].dQ, ups[k].dr, ups[k].lz, damp, power)
+    end
+    return
 end
 
 function update_site!(G::EPApprox, i, dQ, dr, lz, α=1.0, power::Float64=1.0)
@@ -581,187 +633,283 @@ function _rebuild_state_from_sites!(st::CholeskyState, G::EPApprox, avs)
     return st
 end
 
-function _fit_impl!(G::EPApprox, st::ST; qr=QuadRule(20), maxcycles=50, tol=1e-6, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:rel, refresh::Int=1, ess_min::Float64=0.0, batch::Int=0, verbose::Bool=true) where {ST<:AbstractEPState}
+# ===========================================================================
+# fit! driver: normalize the sweep mode, then dispatch to one of two loops —
+#   _fit_sweep_loop!   sequential (batch=0) or mini-batch (batch>0) sweeps
+#   _fit_cached_loop!  EXPERIMENTAL cached-marginal loop (full sweeps only,
+#                      refresh/ess_min; no measured gains yet — keep separate)
+# The per-cycle state maintenance is dispatched on the state type
+# (_pre_sweep!, _batch_pre!/_batch_post!, _fold_sweep!) so the loops contain
+# no `st isa SparseState` conditionals.
+# ===========================================================================
+
+# Precompute the site row views once per fit! when all sites are rank-1 with a
+# uniform A type (concrete eltype) — avoids a ~96 B view allocation per site
+# per cycle in the hot path (perf_alloc.md §3). Falls back to per-site views.
+function _site_row_views(G::EPApprox)
+    all(s -> size(s.A, 1) == 1, G.model.sites) || return nothing
+    cand = [_rowvec(s.A) for s in G.model.sites]
+    return isconcretetype(eltype(cand)) ? cand : nothing
+end
+
+# Sweep-mode normalization — a single block-sweep engine parameterized by the
+# batch size B: batch=1 is exactly sequential Gauss-Seidel (routed to the fused
+# sequential hot path), parallel=true is exactly full Jacobi, i.e. B = n.
+function _normalize_sweep(batch::Int, parallel::Bool, n::Int)
+    batch == 1 && return (0, false)
+    (parallel && batch == 0) && (batch = n)
+    return (batch, batch >= n)
+end
+
+_cache_eligible(st::AbstractEPState) =
+    st isa SparseState || st isa DenseState || st isa CholeskyState
+
+# --- per-cycle state maintenance, dispatched on the state type -------------
+# Generic (non-cache) backends: resync Σ = Q⁻¹, μ = Σr, logdetQ from Q every
+# `resync` cycles (Woodbury drift; the PD backtracking in apply_site! is only
+# valid when Σ ≈ Q⁻¹).
+function _pre_sweep!(st::AbstractEPState, G, ws, avs, use_cache::Bool, refresh_now::Bool, c::Int, resync::Int)
+    (!use_cache && c % resync == 0) && sync!(st)
+    return nothing
+end
+
+# SparseState, cached mode: refactor once per refresh and freeze the factor
+# for the whole sweep (one refactorization + n solves per refresh instead of
+# n refactorizations); with refresh > 1 the factor and marginals stay frozen
+# for `refresh` sweeps (drift accepted, quadrature reweights exactly).
+function _pre_sweep!(st::SparseState, G, ws, avs, use_cache::Bool, refresh_now::Bool, c::Int, resync::Int)
+    if use_cache
+        if refresh_now || !getfield(st, :frozen)
+            thaw!(st); sync!(st)               # fresh factor (refactor if stale)
+            _fill_marg_cache!(ws, st, avs)     # n solves, once per refresh
+            st.jacobi = true
+            st.approx_check = true             # downdates use the cached s
+            freeze!(st)
+        end
+    elseif c % resync == 0
+        setfield!(st, :stale, true)   # force exact refactor from Q (updown drift control)
+        sync!(st)
+    end
+    return nothing
+end
+
+# Dense/Cholesky, cached mode: DEFER the state update — rebuild (Q, r) from the
+# sites and refactor once per refresh, then refill the marginal cache.
+function _pre_sweep!(st::Union{DenseState,CholeskyState}, G, ws, avs, use_cache::Bool, refresh_now::Bool, c::Int, resync::Int)
+    if use_cache
+        if refresh_now
+            _rebuild_state_from_sites!(st, G, avs)
+            _fill_marg_cache!(ws, st, avs)
+        end
+    elseif c % resync == 0
+        sync!(st)
+    end
+    return nothing
+end
+
+# per-batch hooks in the mini-batch loop (SparseState refactors once per batch:
+# freeze for the batch, thaw after)
+_batch_pre!(st::AbstractEPState) = nothing
+function _batch_pre!(st::SparseState)
+    thaw!(st); sync!(st)
+    st.jacobi = true; st.approx_check = true
+    freeze!(st)
+    return nothing
+end
+_batch_post!(st::AbstractEPState) = nothing
+function _batch_post!(st::SparseState)
+    thaw!(st); st.jacobi = false; st.approx_check = false
+    return nothing
+end
+_post_sweep!(st::AbstractEPState) = nothing
+_post_sweep!(st::SparseState) = sync!(st)   # fold the sweep in for the δ check
+
+# end-of-cycle fold-in for a frozen SparseState factor, so the convergence
+# check sees the current μ (cached mode: only at refresh cycles — between
+# refreshes st.μ is stale so Δμ = 0 and δ = δsite)
+_fold_sweep!(st::AbstractEPState, use_cache::Bool, refresh_now::Bool) = nothing
+function _fold_sweep!(st::SparseState, use_cache::Bool, refresh_now::Bool)
+    if getfield(st, :frozen) && (!use_cache || refresh_now)
+        thaw!(st); st.jacobi = false; st.approx_check = false
+        if use_cache
+            freeze!(st)                       # re-freeze for the next cached sweep
+            st.jacobi = true; st.approx_check = true
+        end
+    end
+    return nothing
+end
+
+# --- the three sweep bodies (return δsite, the max site-param change) ------
+
+# sequential Gauss-Seidel: fused scalar hot path for rank-1 sites at power=1
+# (st is concretely typed by the caller → static dispatch, 0 B/site)
+function _sweep_sequential!(G::EPApprox, st::AbstractEPState, avs, qr::QuadRule, stein::Bool, damp::Float64, power::Float64, robust::Bool, robust_tol::Float64)
+    δsite = 0.0
+    for i in 1:nsites(G)
+        if size(G.model.sites[i].A, 1) == 1 && power == 1.0
+            a = avs === nothing ? _rowvec(G.model.sites[i].A) : avs[i]
+            δsite = max(δsite, _site_update_apply_1d!(G, i, a, st, qr, stein, damp, robust, robust_tol))
+        else
+            dQ, dr, lz = site_update(G, i, qr, stein=stein, power=power, robust=robust, robust_tol=robust_tol)
+            δsite = max(δsite, maximum(abs.(dQ .- power .* G.Qi[i])), maximum(abs.(dr .- power .* G.ri[i])))
+            update_site!(G, i, dQ, dr, lz, damp, power)
+        end
+    end
+    return δsite
+end
+
+# mini-batch (block Gauss-Seidel): sites split into batches of size
+# B = min(batch, n); each batch's proposals are computed in parallel against
+# the CURRENT state and applied serially, so later batches see earlier
+# batches' updates. B = n recovers full Jacobi, B = 1 sequential. Fixes the
+# stability of full Jacobi on GLMs (minibatch.md): B ~ sqrt(n)..n/8 at damp=1
+# converges where Jacobi does not, to the same fixed point.
+function _sweep_batch!(G::EPApprox, st::AbstractEPState, avs, batch::Int, qr::QuadRule, stein::Bool, damp::Float64, power::Float64, robust::Bool, robust_tol::Float64)
+    n = nsites(G)
+    B = min(batch, n)
+    δsite = 0.0
+    ups = Vector{NamedTuple{(:dQ, :dr, :lz)}}(undef, B)
+    for b0 in 1:B:n
+        b1 = min(b0 + B - 1, n)
+        _batch_pre!(st)
+        blen = b1 - b0 + 1
+        if blen >= 2 * Threads.nthreads()
+            Threads.@threads for k in 1:blen
+                ups[k] = site_update(G, b0 + k - 1, qr, stein=stein, power=power, robust=robust, robust_tol=robust_tol)
+            end
+        else
+            # small batch: serial compute, threading overhead dominates
+            for k in 1:blen
+                ups[k] = site_update(G, b0 + k - 1, qr, stein=stein, power=power, robust=robust, robust_tol=robust_tol)
+            end
+        end
+        for k in 1:blen
+            i = b0 + k - 1
+            δsite = max(δsite, maximum(abs.(ups[k].dQ .- power .* G.Qi[i])), maximum(abs.(ups[k].dr .- power .* G.ri[i])))
+        end
+        _apply_batch!(G, st, avs, b0, b1, ups, damp, power)   # fused rank-B on DenseState
+        _batch_post!(st)
+    end
+    _post_sweep!(st)
+    return δsite
+end
+
+# EXPERIMENTAL cached-marginal sweep: frozen-factor sweep over the cached
+# marginals — per-site work is read-only (cavity from the cache + reweighted
+# quadrature, no solves), so the compute phase is threaded; the applies
+# (O(1) diagonal updates for unary sites) run serially
+function _sweep_cached!(G::EPApprox, st::AbstractEPState, ws::EPWorkspace, avs, qr::QuadRule, stein::Bool, damp::Float64, robust::Bool, robust_tol::Float64, want_ess::Bool)
+    n = nsites(G)
+    ups = ws.ups
+    Threads.@threads for i in 1:n
+        ups[i] = _hot1d_compute!(G, i, avs[i], st, qr, stein, damp, robust, robust_tol, true, want_ess)
+    end
+    δsite = 0.0
+    for i in 1:n
+        u = ups[i]
+        δsite = max(δsite, u[4])
+        _hot1d_apply!(G, i, avs[i], st, u[1], u[2], u[3], u[5], true)
+    end
+    return δsite
+end
+
+# --- convergence criterion ---------------------------------------------------
+# :strict = max|Δμ| AND max site-param change (the mean alone can be
+# stationary in symmetric models); :max = max|Δμ|; :mean = mean|Δμ| (legacy
+# ep_glm criterion, perf_gap.md §1); :rel = max_i |Δμ_i| / posterior sd_i
+# (scale-free). In cached mode st.μ is stale between refreshes (Δμ = 0), so
+# the site-param change is the only convergence signal there.
+function _convergence_δ(crit::Symbol, dμ::AbstractVector, ws::EPWorkspace, δsite::Float64, use_cache::Bool)
+    if crit === :mean
+        return sum(abs, dμ) / length(dμ)
+    elseif crit === :max
+        return maximum(abs, dμ)
+    elseif crit === :rel
+        δμ = 0.0
+        @inbounds for i in eachindex(dμ)
+            δμ = max(δμ, abs(dμ[i]) / ws.sd[i])
+        end
+        return use_cache ? max(δμ, δsite) : δμ
+    else
+        return max(maximum(abs, dμ), δsite)
+    end
+end
+
+# --- the two loops ------------------------------------------------------------
+
+# main loop: sequential (batch=0) or mini-batch (batch>0) sweeps
+function _fit_sweep_loop!(G::EPApprox, st::AbstractEPState, avs, batch::Int; qr::QuadRule, maxcycles::Int, tol::Float64, damp::Float64, stein::Bool, power::Float64, robust::Bool, robust_tol::Float64, crit::Symbol, resync::Int)
     ws = G.ws
     m = copy(st.μ)
     δ = Inf
-    ncycles = 0                       # actual cycles executed (≤ maxcycles)
+    ncycles = 0
     n = nsites(G)
-    # Precompute the site row views once per fit! when all sites are rank-1
-    # with a uniform A type (concrete eltype) — avoids a ~96 B view allocation
-    # per site per cycle in the hot path (perf_alloc.md §3). Falls back to
-    # per-site views otherwise.
-    avs = nothing
-    if all(s -> size(s.A, 1) == 1, G.model.sites)
-        cand = [_rowvec(s.A) for s in G.model.sites]
-        isconcretetype(eltype(cand)) && (avs = cand)
+    for c in 1:maxcycles
+        _pre_sweep!(st, G, ws, avs, false, false, c, resync)
+        crit === :rel && _post_sd!(ws.sd, st)
+        δsite = batch > 0 ?
+            _sweep_batch!(G, st, avs, batch, qr, stein, damp, power, robust, robust_tol) :
+            _sweep_sequential!(G, st, avs, qr, stein, damp, power, robust, robust_tol)
+        _fold_sweep!(st, false, false)
+        dμ = ws.dμ                       # Δμ into the workspace buffer (no alloc)
+        dμ .= st.μ .- m
+        δ = _convergence_δ(crit, dμ, ws, δsite, false)
+        ncycles = c
+        δ < tol && break
+        m .= st.μ
     end
-    # cached-marginal mode (augmented-EP scheme): parallel + any state backend +
-    # uniform rank-1 sites + power == 1. The per-site marginals (m_i, s_i) are
-    # cached and refreshed every `refresh` cycles (or early when the min
-    # quadrature ESS drops below `ess_min`) — between refreshes the per-site
-    # work is O(1) + quadrature with NO solves/matvecs. SparseState freezes its
-    # factor and keeps updating the sparse Q per site; dense/cholesky DEFER
-    # the state update and rebuild (Q, r) from the sites at each refresh.
-    # Sweep-mode normalization — there is a single block-sweep engine
-    # parameterized by the batch size B: batch=1 is exactly sequential
-    # Gauss-Seidel (routed to the fused sequential hot path, no per-batch
-    # threading or refactor overhead), and parallel=true is exactly full
-    # Jacobi, i.e. B = n (kept as a flag for backward compatibility). The
-    # cached-marginal mode is a property of full sweeps (B = n): only then
-    # are all proposals computed against the same state, so the per-site
-    # marginals can be cached and refreshed every `refresh` cycles.
-    if batch == 1
-        batch = 0
-        parallel = false
-    elseif parallel && batch == 0
-        batch = n
-    end
-    parallel = batch >= n
-    use_cache = parallel && (st isa SparseState || st isa DenseState || st isa CholeskyState) && avs !== nothing && power == 1.0
-    ws.cache_on = use_cache
+    return δ, ncycles
+end
+
+# EXPERIMENTAL cached-marginal loop (full sweeps only): the per-site marginals
+# (m_i, s_i) are cached and refreshed every `refresh` cycles (or early when the
+# min quadrature ESS drops below `ess_min`) — between refreshes the per-site
+# work is O(1) + quadrature with NO solves/matvecs. No measured gains yet;
+# kept as a separate loop on purpose.
+function _fit_cached_loop!(G::EPApprox, st::AbstractEPState, avs; qr::QuadRule, maxcycles::Int, tol::Float64, damp::Float64, stein::Bool, power::Float64, robust::Bool, robust_tol::Float64, crit::Symbol, refresh::Int, ess_min::Float64, resync::Int)
+    ws = G.ws
+    m = copy(st.μ)
+    δ = Inf
+    ncycles = 0
     force_refresh = true
+    for c in 1:maxcycles
+        refresh_now = force_refresh || (c - 1) % refresh == 0
+        _pre_sweep!(st, G, ws, avs, true, refresh_now, c, resync)
+        crit === :rel && _post_sd!(ws.sd, st)   # sparse: no-op while stale/frozen
+        δsite = _sweep_cached!(G, st, ws, avs, qr, stein, damp, robust, robust_tol, ess_min > 0)
+        _fold_sweep!(st, true, refresh_now)
+        dμ = ws.dμ
+        dμ .= st.μ .- m
+        δ = _convergence_δ(crit, dμ, ws, δsite, true)
+        force_refresh = ess_min > 0 && minimum(ws.marg_ess) < ess_min
+        ncycles = c
+        δ < tol && break
+        m .= st.μ
+    end
+    return δ, ncycles
+end
+
+# --- driver -------------------------------------------------------------------
+
+function _fit_impl!(G::EPApprox, st::ST; qr=QuadRule(20), maxcycles=50, tol=1e-6, damp=1.0, stein::Bool=false, parallel::Bool=false, power::Float64=1.0, resync::Int=10, robust::Bool=false, robust_tol::Float64=1e-6, crit::Symbol=:rel, refresh::Int=1, ess_min::Float64=0.0, batch::Int=0, verbose::Bool=true) where {ST<:AbstractEPState}
+    ws = G.ws
+    n = nsites(G)
+    avs = _site_row_views(G)
+    batch, parallel = _normalize_sweep(batch, parallel, n)
+    # cached-marginal mode is a property of full sweeps (B = n): only then are
+    # all proposals computed against the same state, so the marginals can be
+    # cached and refreshed
+    use_cache = parallel && _cache_eligible(st) && avs !== nothing && power == 1.0
+    ws.cache_on = use_cache
     if crit === :rel
         # posterior sd scale for the relative criterion; ws.sd starts at ones
         # so a failed refresh degrades gracefully to the absolute criterion
         _post_sd!(ws.sd, st) || (sync!(st); _post_sd!(ws.sd, st))
     end
-    for c in 1:maxcycles
-        # Woodbury updates drift: resync Σ = Q⁻¹, μ = Σr, logdetQ from Q every
-        # `resync` cycles (and once at the end) instead of re-inverting every
-        # cycle — the PD backtracking in apply_site! is only valid when Σ ≈ Q⁻¹.
-        # SparseState in parallel (Jacobi) mode: refactor once per sweep and
-        # freeze the factor for the whole sweep — one refactorization + n
-        # solves per sweep instead of n refactorizations. Sequential sweeps
-        # keep the exact per-site refactor (Gauss-Seidel, like the dense
-        # backend). With refresh > 1 the factor and marginals stay frozen for
-        # `refresh` sweeps (drift accepted, quadrature reweights exactly).
-        refresh_now = use_cache && (force_refresh || (c - 1) % refresh == 0)
-        if use_cache && st isa SparseState
-            if refresh_now || !getfield(st, :frozen)
-                thaw!(st); sync!(st)               # fresh factor (refactor if stale)
-                if use_cache
-                    _fill_marg_cache!(ws, st, avs) # n solves, once per refresh
-                end
-                st.jacobi = true
-                st.approx_check = use_cache        # downdates use the cached s
-                freeze!(st)
-            end
-        elseif use_cache && refresh_now
-            # dense/cholesky cache mode: rebuild (Q, r) from the sites and
-            # refactor once per refresh, then refill the marginal cache
-            _rebuild_state_from_sites!(st, G, avs)
-            _fill_marg_cache!(ws, st, avs)
-        elseif !use_cache && c % resync == 0
-            sync!(st)
-        end
-        crit === :rel && _post_sd!(ws.sd, st)   # sparse: no-op while stale/frozen
-        δsite = 0.0
-        if use_cache
-            # frozen-factor sweep over the cached marginals: per-site work is
-            # read-only (cavity from the cache + reweighted quadrature, no
-            # solves), so the compute phase is threaded; the applies
-            # (O(1) diagonal updates for unary sites) run serially
-            ups = ws.ups
-            want_ess = ess_min > 0
-            Threads.@threads for i in 1:n
-                ups[i] = _hot1d_compute!(G, i, avs[i], st, qr, stein, damp, robust, robust_tol, true, want_ess)
-            end
-            for i in 1:n
-                u = ups[i]
-                δsite = max(δsite, u[4])
-                _hot1d_apply!(G, i, avs[i], st, u[1], u[2], u[3], u[5], true)
-            end
-        elseif batch > 0
-            # mini-batch (block Gauss-Seidel): sites split into batches of
-            # size B = min(batch, n); each batch's proposals are computed in
-            # parallel against the CURRENT state and applied serially, so
-            # later batches see earlier batches' updates. B = n recovers full
-            # Jacobi, B = 1 sequential. SparseState refactors once per batch
-            # (freeze for the batch, thaw after). Fixes the stability of full
-            # Jacobi on GLMs (minibatch.md): B ~ sqrt(n)..n/8 at damp=1
-            # converges where Jacobi does not, to the same fixed point.
-            B = min(batch, n)
-            ups = Vector{NamedTuple{(:dQ, :dr, :lz)}}(undef, B)
-            for b0 in 1:B:n
-                b1 = min(b0 + B - 1, n)
-                if st isa SparseState
-                    thaw!(st); sync!(st)               # one refactor per batch
-                    st.jacobi = true; st.approx_check = true
-                    freeze!(st)
-                end
-                blen = b1 - b0 + 1
-                if blen >= 2 * Threads.nthreads()
-                    Threads.@threads for k in 1:blen
-                        ups[k] = site_update(G, b0 + k - 1, qr, stein=stein, power=power, robust=robust, robust_tol=robust_tol)
-                    end
-                else
-                    # small batch: serial compute, threading overhead dominates
-                    for k in 1:blen
-                        ups[k] = site_update(G, b0 + k - 1, qr, stein=stein, power=power, robust=robust, robust_tol=robust_tol)
-                    end
-                end
-                for k in 1:(b1 - b0 + 1)
-                    i = b0 + k - 1
-                    δsite = max(δsite, maximum(abs.(ups[k].dQ .- power .* G.Qi[i])), maximum(abs.(ups[k].dr .- power .* G.ri[i])))
-                    update_site!(G, i, ups[k].dQ, ups[k].dr, ups[k].lz, damp, power)
-                end
-                if st isa SparseState
-                    thaw!(st); st.jacobi = false; st.approx_check = false
-                end
-            end
-            st isa SparseState && sync!(st)   # fold the sweep in for the δ check
-        else
-            for i in 1:n
-                if size(G.model.sites[i].A, 1) == 1 && power == 1.0
-                    # fused scalar hot path (perf_gap.md §7; perf_alloc.md §3);
-                    # st is concretely typed here → static dispatch, 0 B/site
-                    a = avs === nothing ? _rowvec(G.model.sites[i].A) : avs[i]
-                    δsite = max(δsite, _site_update_apply_1d!(G, i, a, st, qr, stein, damp, robust, robust_tol))
-                else
-                    dQ, dr, lz = site_update(G, i, qr, stein=stein, power=power, robust=robust, robust_tol=robust_tol)
-                    δsite = max(δsite, maximum(abs.(dQ .- power .* G.Qi[i])), maximum(abs.(dr .- power .* G.ri[i])))
-                    update_site!(G, i, dQ, dr, lz, damp, power)
-                end
-            end
-        end
-        # convergence criterion: :strict = max|Δμ| AND max site-param change
-        # (the mean alone can be stationary in symmetric models — default);
-        # :max = max|Δμ| only; :mean = mean|Δμ| (legacy ep_glm criterion,
-        # matches legacy cycle counts exactly — perf_gap.md §1).
-        # SparseState (parallel mode): fold the sweep's accumulated updates
-        # into the factor once, so the convergence check below sees the
-        # current μ. With refresh > 1 this happens only at refresh cycles —
-        # between refreshes st.μ is stale so Δμ = 0 and δ = δsite.
-        if st isa SparseState && getfield(st, :frozen) && (!use_cache || refresh_now)
-            thaw!(st); st.jacobi = false; st.approx_check = false
-            use_cache && freeze!(st)   # re-freeze for the next cached sweep
-            use_cache && (st.jacobi = true; st.approx_check = true)
-        end
-        # Δμ goes into the workspace buffer (no per-cycle allocation).
-        dμ = ws.dμ
-        dμ .= st.μ .- m
-        δ = if crit === :mean
-            sum(abs, dμ) / length(dμ)
-        elseif crit === :max
-            maximum(abs, dμ)
-        elseif crit === :rel
-            # scale-free: max_i |Δμ_i| / posterior sd_i — the mean has
-            # stabilised to a fraction `tol` of the posterior std dev
-            δμ = 0.0
-            @inbounds for i in eachindex(dμ)
-                δμ = max(δμ, abs(dμ[i]) / ws.sd[i])
-            end
-            # in cached-marginal mode st.μ is stale between refreshes (Δμ = 0),
-            # so the site-param change is the only convergence signal there
-            use_cache ? max(δμ, δsite) : δμ
-        else
-            max(maximum(abs, dμ), δsite)
-        end
-        force_refresh = use_cache && ess_min > 0 && minimum(ws.marg_ess) < ess_min
-        ncycles = c                   # count the cycle just executed
-        δ < tol && break
-        m .= st.μ
+    if use_cache
+        δ, ncycles = _fit_cached_loop!(G, st, avs; qr=qr, maxcycles=maxcycles, tol=tol, damp=damp, stein=stein, power=power, robust=robust, robust_tol=robust_tol, crit=crit, refresh=refresh, ess_min=ess_min, resync=resync)
+    else
+        δ, ncycles = _fit_sweep_loop!(G, st, avs, batch; qr=qr, maxcycles=maxcycles, tol=tol, damp=damp, stein=stein, power=power, robust=robust, robust_tol=robust_tol, crit=crit, resync=resync)
     end
     if use_cache && !(st isa SparseState)
         _rebuild_state_from_sites!(st, G, avs)   # fold the last sweeps into (Q, r)

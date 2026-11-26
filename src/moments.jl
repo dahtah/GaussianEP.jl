@@ -38,7 +38,19 @@ _tilted_quad(::Val{1}, lik, y, m::AbstractVector, S::AbstractMatrix, qr::QuadRul
     _tilted_moments_1d(lik, y, m[1], S[1,1], qr, stein, power)
 function _tilted_quad(::Val{d}, lik, y, m::AbstractVector, S::AbstractMatrix, qr::QuadRule, stein::Bool, power::Float64) where {d}
     d <= 3 || throw(ArgumentError("tensor quadrature supports rank ≤ 3, got rank $d; provide an analytic moment rule for this likelihood"))
-    L = cholesky(Symmetric(S)).L
+    if !all(isfinite, S) || !all(isfinite, m)
+        # state drifted to NaN (aggressive updates on non-log-concave targets):
+        # signal degenerate quadrature — site_update turns lz=-Inf into a no-op
+        return (z=0.0, lz=-Inf, μ=copy(m), Σ=Symmetric(Matrix{Float64}(I, d, d)))
+    end
+    # clamp the cavity covariance to the PD cone if needed (a drifted state can
+    # hand us a non-PD S; better an approximate cavity than a crash)
+    L = try
+        cholesky(Symmetric(S)).L
+    catch
+        F = eigen(Symmetric(S))
+        cholesky(Symmetric(F.vectors * Diagonal(clamp.(F.values, 1e-12, Inf)) * F.vectors')).L
+    end
     # qr.grid === nothing: full tensor product of the 1-D rule (x, w).
     # qr.grid !== nothing (smolyak_rule(level, d)): explicit d×npts sparse
     # grid with signed weights — handled with a signed log-sum-exp below.

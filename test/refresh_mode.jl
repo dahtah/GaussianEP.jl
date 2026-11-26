@@ -86,3 +86,41 @@ end
     @test Gb.lastδ < 1e-6
     @test abs(log_ml(Gb) - log_ml(Gd)) < 1e-4
 end
+
+@testset "rank-B fused apply (DenseState apply_sites!)" begin
+    rng = MersenneTwister(21)
+    p, B = 30, 12
+    Q0 = Matrix(Symmetric(randn(rng, p, p) * 0.1 + 5I))
+    r0 = randn(rng, p)
+    # fused vs B sequential rank-1 applies: identical up to roundoff
+    st1 = GaussianEP.DenseState(Q0, r0)
+    st2 = GaussianEP.DenseState(Q0, r0)
+    A = randn(rng, p, B)
+    δq = -0.05 .* rand(rng, B) .+ 0.02         # downdates, combined K stays PD
+    δr = randn(rng, B)
+    applied = GaussianEP.apply_sites!(st1, A, δq, δr)
+    @test applied !== nothing
+    for k in 1:B
+        GaussianEP.apply_site!(st2, A[:, k], δq[k], δr[k])
+    end
+    @test maximum(abs.(st1.Q .- st2.Q)) < 1e-10
+    @test maximum(abs.(st1.r .- st2.r)) < 1e-12
+    @test maximum(abs.(st1.Σ .- st2.Σ)) < 1e-8
+    @test maximum(abs.(st1.μ .- st2.μ)) < 1e-8
+    @test abs(st1.logdetQ - st2.logdetQ) < 1e-8
+    # non-PD combined update: returns nothing (caller falls back per-site)
+    st3 = GaussianEP.DenseState(Q0, r0)
+    @test GaussianEP.apply_sites!(st3, A, -100 .* ones(B), δr) === nothing
+    # EP level: mini-batch with fused applies converges to the sequential fixed point
+    p2, n = 50, 800
+    X = randn(rng, p2, n)
+    y = rand(rng, n) .> 0.5
+    M = glm_model(X, y, Logit(), 0.1)
+    Gs = ep(M; backend=:dense, maxcycles=200, tol=1e-11, verbose=false)
+    Gb = ep(M; backend=:dense, batch=64, maxcycles=200, tol=1e-11, verbose=false)
+    Gp = ep(M; backend=:dense, parallel=true, maxcycles=200, tol=1e-11, verbose=false)
+    @test abs(log_ml(Gb) - log_ml(Gs)) < 1e-5
+    @test abs(log_ml(Gp) - log_ml(Gs)) < 1e-5
+    @test maximum(abs.(mean(Gb) .- mean(Gs))) < 1e-4
+    @test maximum(abs.(mean(Gp) .- mean(Gs))) < 1e-4
+end

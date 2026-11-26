@@ -133,7 +133,18 @@ end
 # EPApprox are built for the whole path; the grid point τ is moved in place
 # with set_tau! (one refactorisation, no per-site loop) and the site
 # parameters are warm-started across grid points.
-function _regpath_tau(S,τ0,τ1;nsteps=10,maxcycles=24,tol=1e-3,qr=S.qr)
+"""
+    _regpath_tau(S::GLMSites, τ0, τ1; nsteps=10, maxcycles=24, tol=1e-3, qr=S.qr,
+                 batch=0, refresh=1, ess_min=0.0, crit=:rel, verbose=true)
+
+Legacy-signature regularisation path over τ on the new EP core: returns
+`(τs, μs, logmls)` with `τs` **ascending**. The `fit!` keywords `batch`,
+`refresh`, `ess_min`, `crit` and `verbose` are accepted with the same
+defaults as `fit!` and forwarded to every `fit!` call along the path.
+"""
+function _regpath_tau(S,τ0,τ1;nsteps=10,maxcycles=24,tol=1e-3,qr=S.qr,
+                      batch::Int=0,refresh::Int=1,ess_min::Float64=0.0,
+                      crit::Symbol=:rel,verbose::Bool=true)
     m = size(S.X,1)
     μs = zeros(m,nsteps)
     τs = exp.(range(log(τ0),log(τ1),nsteps))
@@ -142,7 +153,8 @@ function _regpath_tau(S,τ0,τ1;nsteps=10,maxcycles=24,tol=1e-3,qr=S.qr)
     G = EPApprox(M; qr=qr)
     for (i,τ) in enumerate(τs)
         set_tau!(G,τ)
-        fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, crit=:mean)
+        fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, crit=crit, batch=batch,
+             refresh=refresh, ess_min=ess_min, verbose=verbose)
         μs[:,i] = mean(G)
         lz[i] = log_ml(G)
     end
@@ -152,17 +164,30 @@ end
 # Empirical-Bayes selection of τ on the new core, legacy signature: scans the
 # grid (warm-started, τ moved in place with set_tau!) and refits at the τ
 # maximising the EP log marginal likelihood. Returns (τ_opt=..., G=...).
-function _autotune_tau(S,τ0,τ1;nsteps=10,maxcycles=24,tol=1e-3,qr=S.qr)
+"""
+    _autotune_tau(S::GLMSites, τ0, τ1; nsteps=10, maxcycles=24, tol=1e-3, qr=S.qr,
+                  batch=0, refresh=1, ess_min=0.0, crit=:rel, verbose=true)
+
+Legacy-signature autotune over τ on the new EP core: returns
+`(τ_opt=τ_opt, G=G)`. The `fit!` keywords `batch`, `refresh`, `ess_min`,
+`crit` and `verbose` are accepted with the same defaults as `fit!` and
+forwarded to every `fit!` call.
+"""
+function _autotune_tau(S,τ0,τ1;nsteps=10,maxcycles=24,tol=1e-3,qr=S.qr,
+                       batch::Int=0,refresh::Int=1,ess_min::Float64=0.0,
+                       crit::Symbol=:rel,verbose::Bool=true)
     τs = exp.(range(log(τ0),log(τ1),nsteps))
     M = glm_model(S.X, S.y, S.lik, 1.0)
     G = EPApprox(M; qr=qr)
     set_tau!(G,τ0)
-    fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, crit=:mean)
+    fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, crit=crit, batch=batch,
+         refresh=refresh, ess_min=ess_min, verbose=verbose)
     lz = log_ml(G)
     τ_opt=τ0
     for τ in τs
         set_tau!(G,τ)
-        fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, crit=:mean)
+        fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, crit=crit, batch=batch,
+             refresh=refresh, ess_min=ess_min, verbose=verbose)
         nz = log_ml(G)
         if nz > lz
             lz = nz
@@ -170,7 +195,8 @@ function _autotune_tau(S,τ0,τ1;nsteps=10,maxcycles=24,tol=1e-3,qr=S.qr)
         end
     end
     set_tau!(G,τ_opt)
-    fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, crit=:mean)
+    fit!(G; qr=qr, maxcycles=maxcycles, tol=tol, crit=crit, batch=batch,
+         refresh=refresh, ess_min=ess_min, verbose=verbose)
     (τ_opt=τ_opt,G=G)
 end
 

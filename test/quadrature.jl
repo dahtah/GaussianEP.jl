@@ -266,3 +266,58 @@ end
     # the sparse grid is much smaller than the full tensor grid at level 8
     @test length(qs.w) < (2^7 + 1)^2
 end
+
+# --- Smolyak sparse grids on ACTUAL models (status.md TODO "Test the Smolyak
+# sparse grid on actual models"; numbers/findings in smolyak_models.md) ---
+using Random
+
+@testset "smolyak on a rank-3 logistic model (actual model)" begin
+    # two rank-3 sites f(η) = σ(c'η) on m = 6, log_dens = loglogistic(c'η)
+    c1 = [0.8, -0.5, 0.3]; c2 = [-0.4, 0.9, 0.6]
+    lik1 = ConfineLik(η -> -GaussianEP.loglogistic(dot(c1, η)))
+    lik2 = ConfineLik(η -> -GaussianEP.loglogistic(dot(c2, η)))
+    A1 = [1.0 0 0 0.3 0 0; 0 1.0 0 0 0.3 0; 0 0 1.0 0 0 0.3]
+    A2 = [0.0 0 0 1.0 0 0; 0 0 0 0 1.0 0; 0 0 0 0 0 1.0]
+    ML = EPModel(Matrix(I, 6, 6), [Site(A1, 1.0, lik1), Site(A2, 1.0, lik2)])
+    Gref = ep(ML, qr=QuadRule(40), tol=1e-10, maxcycles=400, damp=0.7)  # 64000 nodes
+    qs = GaussianEP.smolyak_rule(6, 3)                                   # 417 nodes
+    Gs = ep(ML, qr=qs, tol=1e-10, maxcycles=400, damp=0.7)
+    @test isfinite(log_ml(Gs))
+    @test abs(log_ml(Gs) - log_ml(Gref)) < 1e-3
+    @test maximum(abs.(mean(Gs) - mean(Gref))) < 1e-3
+    @test maximum(abs.(cov(Gs) - cov(Gref))) < 1e-2
+    # far fewer nodes than the full tensor grid at the same level (33^3)
+    @test length(qs.w) < (2^5 + 1)^3
+end
+
+@testset "smolyak d=1 on a 1D GMRF logistic model" begin
+    rng = MersenneTwister(42)
+    p = 60
+    y = rand(rng, p) .> 0.5
+    M1 = gmrf_1d(y, Logit(); ρ=1.0)          # rank-1 sites
+    Gref = ep(M1, qr=QuadRule(40), tol=1e-10, maxcycles=400)
+    qs = GaussianEP.smolyak_rule(5, 1)       # d=1 reduces to GH with 17 nodes
+    @test qs.grid === nothing
+    @test length(qs.w) == 17
+    Gs = ep(M1, qr=qs, tol=1e-10, maxcycles=400)
+    @test abs(log_ml(Gs) - log_ml(Gref)) < 1e-9
+    @test maximum(abs.(mean(Gs) - mean(Gref))) < 1e-9
+end
+
+@testset "smolyak signed-weight fallback (z<=0 -> cavity moments)" begin
+    # sharp ring factor: the signed Smolyak sum is non-positive on some
+    # cavities; _tilted_quad then falls back to the cavity moments
+    lik = ConfineLik(η -> 10 * (sum(abs2, η) - 1)^2)
+    qr = GaussianEP.smolyak_rule(4, 2)
+    hits = Tuple{Vector{Float64}, Float64}[]
+    for m1 in -2.0:0.5:2.0, m2 in -2.0:0.5:2.0, s2 in (0.05, 0.2, 0.5, 1.0, 2.0)
+        t = GaussianEP.tilted_moments(lik, 0.0, [m1, m2], s2 .* Matrix(I, 2, 2), qr)
+        t.lz == -Inf && push!(hits, ([m1, m2], s2))
+    end
+    @test length(hits) > 0                    # fallback does trigger on this factor
+    m, s2 = hits[1]
+    t = GaussianEP.tilted_moments(lik, 0.0, m, s2 .* Matrix(I, 2, 2), qr)
+    @test t.lz == -Inf
+    @test t.μ == m                            # cavity moments returned
+    @test Matrix(t.Σ) == s2 .* Matrix(I, 2, 2)
+end

@@ -19,17 +19,23 @@
 #
 # SparseState (scenario 3B of linear_algebra.md, everything sparse — Ising /
 # gas / GMRF on a grid): the sparse Q, r are the source of truth; a CHOLMOD
-# factor (stdlib SparseArrays.CHOLMOD, AMD ordering) is cached and refreshed
-# by `ensure_fresh!` whenever Q changed (`stale` flag). Site updates
-# accumulate into the sparse Q (O(nnz(a)²) for a rank-1 site with sparse row
-# a) and mark the factor stale; the next read refactorizes once — measured
-# cheaper than per-site CHOLMOD up/downdates on 2-D grids (sparse_backends.md:
-# fresh factor 5–14 ms vs rank-1 updown ~45 ms at p=10⁴), so sequential EP
-# refactorizes per site (cheap for banded 1-D Q) and the parallel/batched path
-# refactorizes once per sweep. PD pre-check K = 1 + s·δq > 0 before accepting a
-# negative-δq update (a failed CHOLMOD downdate corrupts the factor silently,
-# so we never rely on updown here). No new dependency: CHOLMOD is in the
-# SparseArrays stdlib on Julia 1.13.
+# factor (stdlib SparseArrays.CHOLMOD) is cached. Since the sparsity pattern of
+# Q = Q0 + Σᵢ AᵢQᵢAᵢ' is constant across EP iterations (only values change),
+# the fill-reducing ordering (AMD) + symbolic analysis run ONCE (cached in F,
+# with a pattern fingerprint; re-analyzed only if the pattern changes) and every
+# refactor is numeric-only via `ldlt!(F, A)` — 1.3–2.5× cheaper than a fresh
+# `ldlt`. Rank-1 site applies outside frozen sweeps use an in-place CHOLMOD
+# up/downdate (`lowrankupdowndate!`, update vector in the permuted order) —
+# O(nnz(L) on the etree path of supp(a)), 0.002–0.03 ms with sparse site rows
+# vs 0.2–5 ms per numeric refactor — so sequential EP no longer refactorizes
+# per site; Q is updated in parallel and an exact refactor from Q runs every
+# `resync` cycles (drift control). Inside frozen (Jacobi/cache) sweeps the
+# factor is NOT updowned (cavities must see the sweep-start factor): updates
+# accumulate into Q and the factor is refactored (numeric-only) at thaw. PD
+# pre-check K = 1 + s·δq > 0 before accepting a negative-δq update, plus an
+# `issuccess` check after every updown (a failed CHOLMOD downdate corrupts the
+# factor silently → mark stale, refactor with shift on next read). No new
+# dependency: CHOLMOD is in the SparseArrays stdlib on Julia 1.13.
 #
 # The state also carries `τ`, the scale of the base measure: the model's Q0 is
 # interpreted as the UNSCALED base and the effective prior precision matrix is
@@ -137,6 +143,13 @@ marginal(st::DenseState, A::AM) where AM<:AbstractMatrix = (A * st.μ, Symmetric
 function cavity(st::DenseState, A::AM, Qi::QM, ri::RV, power::Float64=1.0) where {AM<:AbstractMatrix, QM<:AbstractMatrix, RV<:AbstractVector}
     S = Symmetric(A * st.Σ * A')
     m = A * st.μ
+    if !all(isfinite, S) || !all(isfinite, m) || !isposdef(S)
+        # Σ drifted to garbage / lost PD (aggressive fractional-EP updates on
+        # non-log-concave targets): rebuild from Q once, then clamp below
+        sync!(st)
+        S = Symmetric(A * st.Σ * A')
+        m = A * st.μ
+    end
     Si = _small_pd_inv(S)
     QiS = Symmetric(Qi)
     λmaxQi = maximum(eigvals(QiS))
@@ -195,20 +208,32 @@ function apply_site!(st::DenseState, A::AM, δQ::DQM, δr::DRV; rmax::Float64=1e
     all(isfinite, δr) || fill!(δr, zero(eltype(δr)))
     K = I + SAA * δQ
     # Q + A'δQ A stays PD iff K = I + AΣA'δQ is PD (determinant lemma); backtrack
-    # δ if not. The backtracking also guards δr (a garbage cavity can produce
-    # δr ~ 1e27 with δQ ≈ 0, K trivially PD): halve both until K is PD and
-    # |δr| ≤ rmax.
-    while (!isposdef(Symmetric(K)) || maximum(abs.(δr)) > rmax) &&
+    # δ if not. K is NONSYMMETRIC for d > 1 (SAA·δQ ≠ δQ·SAA), so isposdef of
+    # the symmetric part alone does not imply det K > 0 — check both (the
+    # logdet below would throw DomainError on det K < 0). The backtracking
+    # also guards δr (a garbage cavity can produce δr ~ 1e27 with δQ ≈ 0):
+    # halve both until K is PD, det K > 0 and |δr| ≤ rmax.
+    ld, sgn = logabsdet(Matrix(K))
+    # ok = PD proxy + det K safely positive (not underflowed: an ill-conditioned
+    # K can pass det > 0 yet make the LU in δQ/K hit an exact zero pivot)
+    _kok(ld, sgn, K) = sgn > 0 && isfinite(ld) && ld > -600 && isposdef(Symmetric(K))
+    while (!_kok(ld, sgn, K) || maximum(abs.(δr)) > rmax) &&
           (maximum(abs.(δQ)) > 1e-14 || maximum(abs.(δr)) > rmax)
         δQ ./= 2
         δr ./= 2
         K = I + SAA * δQ
+        ld, sgn = logabsdet(Matrix(K))
     end
-    (isposdef(Symmetric(K)) && maximum(abs.(δr)) <= rmax) || return nothing  # skip
+    (_kok(ld, sgn, K) && maximum(abs.(δr)) <= rmax) || return nothing  # skip
+    Kinv = try
+        inv(Matrix(K))
+    catch
+        return nothing                  # LU failed despite the guards: skip
+    end
     st.Q .+= A' * δQ * A
     st.r .+= A' * δr
-    st.logdetQ += LinearAlgebra.logdet(Matrix(K))   # determinant lemma; K is d×d and PD here
-    st.Σ .-= SA * (δQ / K) * SA'
+    st.logdetQ += ld                            # determinant lemma; det K > 0 guaranteed above
+    st.Σ .-= SA * (δQ * Kinv) * SA'
     # NB: no `st.Σ .= Symmetric(st.Σ)` here — the Woodbury update above is
     # symmetric up to roundoff (SA*(δQ/K)*SA' is a symmetric product), and the
     # full p² copy cost ~20 KB and ~5 µs per site update in the EP hot loop
@@ -258,6 +283,76 @@ function apply_site!(st::DenseState, a::AV, δq::Real, δr::Real, Sa::Vector{Flo
     return (δq, δr)
 end
 
+# --- rank-B fused apply (mini-batch / full-Jacobi sweeps on the dense backend) ---
+# One Woodbury update for Q += A Diagonal(δq) A', r += A δr with A a p×B matrix
+# whose columns are the site rows a_i. With SA = ΣA (p×B), SAA = A'SA (B×B),
+# D = Diagonal(δq), the Woodbury kernel is K = I + SAA·D — nonsymmetric in
+# general. Use instead the symmetric M = D⁻¹ + SAA: by Sylvester,
+#   det K = det(D)·det(M),   K⁻¹ = D⁻¹ M⁻¹   (so D·K⁻¹ = M⁻¹),
+# and for δq > 0, K has positive eigenvalues iff M is PD. One Cholesky
+# factorisation of M therefore gives the PD test, logdet K = logdet M + Σ log|δq|,
+# and the inverse M⁻¹ = C\I used in the updates:
+#   Σ -= SA_J M⁻¹ SA_J',  logdetQ += logdet K,
+#   μ += SA δr − SA_J M⁻¹ (t_J + SAA[J,:] δr),  t = SA'r (OLD r).
+# Algebraically identical to B sequential rank-1 applies (both are the exact
+# Woodbury identity for the combined update), but O(p²) memory traffic on Σ/Q
+# (one gemm pass each) instead of O(B p²) (B gers). Returns nothing — caller
+# falls back to per-site applies with PD backtracking — when M is not PD,
+# det K ≤ 0, or |δr| exceeds rmax.
+function apply_sites!(st::DenseState, A::AbstractMatrix, δq::AbstractVector, δr::AbstractVector; rmax::Float64=1e12)
+    all(isfinite, δq) || return nothing
+    all(isfinite, δr) || return nothing
+    maximum(abs.(δr)) <= rmax || return nothing
+    SA = st.Σ * A                       # p×B
+    t = SA' * st.r                      # B — MUST use the OLD r (before the r update)
+    # columns with δq == 0 don't enter Q (D⁻¹ undefined there); they only
+    # contribute to r (and hence μ) — handle them separately
+    J = findall(!iszero, δq)
+    if isempty(J)
+        st.r .+= A * δr
+        st.μ .+= SA * δr                # μ⁺ = Σ r⁺ with Σ unchanged
+        return (δq, δr)
+    end
+    d = δq[J]                           # b = |J|
+    all(isfinite, 1 ./ d) || return nothing
+    AJ = A[:, J]                        # p×b
+    SAJ = SA[:, J]                      # p×b
+    SAA = A' * SA                       # B×B, symmetric up to roundoff
+    SAAJ = Matrix(SAA[J, J])
+    if all(>(0), d)
+        # common case (sites add precision): M = D⁻¹ + SAA is symmetric and,
+        # for D > 0, K has positive eigenvalues iff M is PD — one Cholesky
+        # factorisation gives the PD test, logdet K = logdet M + Σ log d,
+        # and the inverse M⁻¹ = D·K⁻¹ = C\I
+        M = Diagonal(1 ./ d) .+ SAAJ
+        C = try
+            cholesky(Symmetric(M))
+        catch
+            return nothing              # M not PD → update would make Q indefinite
+        end
+        ld = 2 * sum(log, diag(C.L)) + sum(log, d)
+        (isfinite(ld) && ld > -600) || return nothing
+        Minv = C \ I                    # M⁻¹ = D·K⁻¹, reusing the Cholesky factor
+    else
+        # indefinite D: PD-ness of M is not the right test; check K's eigenvalues
+        # directly (they are real — K is similar to the symmetric
+        # I + SAA^{1/2} D SAA^{1/2}) and invert K by LU
+        K = I + SAAJ * Diagonal(d)
+        ev = eigvals(K)
+        all(e -> abs(imag(e)) < 1e-8 && real(e) > 0, ev) || return nothing
+        ld = sum(log, real.(ev))        # logdet K
+        (isfinite(ld) && ld > -600) || return nothing
+        Minv = Diagonal(d) * (try inv(K) catch; return nothing end)  # D·K⁻¹
+    end
+    mul!(st.Q, AJ .* d', AJ', 1.0, 1.0) # Q += A_J Diagonal(d) A_J'  (one gemm pass over Q)
+    st.r .+= A * δr
+    st.logdetQ += ld
+    mul!(st.Σ, SAJ, Minv * SAJ', -1.0, 1.0)      # Σ -= SA_J M⁻¹ SA_J' (one gemm pass over Σ)
+    u = Minv * (t[J] .+ SAA[J, :] * δr)          # b — exact μ update: μ⁺ = Σ⁺ r⁺
+    st.μ .+= SA * δr .- SAJ * u
+    return (δq, δr)                     # the applied change
+end
+
 # --- interface: replace (Q, r) wholesale (warm starts across hyperparameters) ---
 function reset!(st::DenseState, Q::AbstractMatrix, r::AbstractVector)
     st.Q .= Q
@@ -293,7 +388,9 @@ end
 function _post_sd!(buf::AbstractVector, st::DenseState)
     Σ = st.Σ
     @inbounds for i in eachindex(buf)
-        buf[i] = sqrt(Σ[i, i])
+        # clamp: Woodbury drift can make a diagonal entry transiently ≤ 0;
+        # the floor keeps δ_rel large (no premature stop) instead of NaN
+        buf[i] = sqrt(max(Σ[i, i], 1e-12))
     end
     return true
 end
@@ -359,7 +456,7 @@ function _post_sd!(buf::AbstractVector, st::CholeskyState)
             lki = L[k, i]
             acc += lki * lki * buf[k]
         end
-        buf[i] = acc / (lii * lii)
+        buf[i] = max(acc / (lii * lii), 1e-12)   # clamp: keep δ_rel finite/large if factor broke
     end
     @inbounds for i in 1:p
         buf[i] = sqrt(buf[i])
@@ -526,7 +623,10 @@ end
 mutable struct SparseState{T} <: AbstractEPState
     Q :: SparseMatrixCSC{T,Int}
     r :: Vector{T}
-    F :: SparseArrays.CHOLMOD.Factor{T,Int}   # cached factor of Q (valid iff !stale)
+    F :: SparseArrays.CHOLMOD.Factor{T,Int}   # cached factor of Q (valid iff !stale); doubles as the symbolic cache (ordering computed once)
+    pat_colptr :: Vector{Int}   # pattern fingerprint of Q when F was last analyzed
+    pat_rowval :: Vector{Int}
+    iperm :: Vector{Int}        # invperm(get_perm(F)): updown C rows = iperm[supp(a)] (C passed as C_orig[perm])
     μ :: Vector{T}
     logdetQ :: T
     τ :: T          # scale of the base measure: effective Q0 = τ·Q0 (default 1)
@@ -540,33 +640,49 @@ end
 function SparseState(Q0::AbstractMatrix, r0::AbstractVector)
     Q = sparse(Q0)
     r = Vector{Float64}(r0)
-    st = SparseState{Float64}(Q, r, ldlt(Symmetric(Q)), zeros(Float64, size(Q,1)), 0.0, 1.0, true, false, false, 0.0, false)
+    st = SparseState{Float64}(Q, r, ldlt(Symmetric(Q)), Int[], Int[], Int[], zeros(Float64, size(Q,1)), 0.0, 1.0, true, false, false, 0.0, false)
     sync!(st)   # stale=true so this computes μ and logdetQ from the factor
     return st
 end
 
 # CHOLMOD LDL' factorization (simplicial — measured ~10x faster triangular
 # solves than the supernodal LL factor on tridiagonal/grid patterns, and less
-# fill) with escalating diagonal shift. Inside a frozen sweep the K = 1+s·δq > 0
-# pre-check runs against the sweep-start factor, so the accumulated Q can lose
-# PD (sum of individually-PD downdates; strong Ising couplings) — a failed
-# factorization throws PosDefException. The shift is applied inside CHOLMOD
-# (Q itself is never modified), so the cache corresponds to Q + εI with ε only
-# as large as needed; the last shift 2p·scale always succeeds since
-# λ_min ≥ -λ_max ≥ -tr(Q) = -p·scale.
-function _sparse_ldlt(Q::SparseMatrixCSC)
+# fill) REUSING the cached symbolic factor: the sparsity pattern of
+# Q = Q0 + Σᵢ AᵢQᵢAᵢ' is constant across EP iterations (only the Qᵢ values
+# change), so the fill-reducing ordering (AMD) and the symbolic analysis are
+# computed ONCE — at setup or when the pattern fingerprint changes — and every
+# refactor runs only the numeric phase via `ldlt!(F, A)`. Measured: numeric-only
+# refactor is 1.3–2.5× cheaper than a fresh `ldlt` (which re-runs the ordering
+# every time): 0.86 vs 2.13 ms at p=2·10⁴ tridiagonal, 5.3 vs 6.8 ms at p=10⁴
+# 2-D grid. Escalating diagonal shift if Q lost PD (inside a frozen sweep the
+# K = 1+s·δq > 0 pre-check runs against the sweep-start factor, so the
+# accumulated Q can lose PD — sum of individually-PD downdates, strong Ising
+# couplings). The shift is applied inside CHOLMOD (Q itself is never modified),
+# so the cache corresponds to Q + εI with ε only as large as needed; the last
+# shift 2p·scale always succeeds since λ_min ≥ -λ_max ≥ -tr(Q) = -p·scale.
+function _sparse_ldlt!(st::SparseState)
+    Q = getfield(st, :Q)
+    A = SparseArrays.CHOLMOD.Sparse(Symmetric(Q))
+    F = getfield(st, :F)
+    if size(F, 1) != size(Q, 1) || Q.colptr != getfield(st, :pat_colptr) || Q.rowval != getfield(st, :pat_rowval)
+        F = SparseArrays.CHOLMOD.symbolic(A)      # one ordering + symbolic analysis
+        st.F = F
+        st.pat_colptr = copy(Q.colptr)
+        st.pat_rowval = copy(Q.rowval)
+        st.iperm = invperm(SparseArrays.CHOLMOD.get_perm(F))
+    end
     try
-        return ldlt(Symmetric(Q)), 0.0
+        return SparseArrays.CHOLMOD.ldlt!(F, A), 0.0
     catch e
-        e isa PosDefException || rethrow()
+        (e isa PosDefException || e isa ZeroPivotException) || rethrow()
     end
     p = size(Q, 1)
     scale = sum(abs, diag(Q)) / max(p, 1)
     for ε in (1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-2, 1.0, 2p)
         try
-            return ldlt(Symmetric(Q); shift=ε * scale), ε * scale
+            return SparseArrays.CHOLMOD.ldlt!(F, A; shift=ε * scale), ε * scale
         catch e
-            e isa PosDefException || rethrow()
+            (e isa PosDefException || e isa ZeroPivotException) || rethrow()
         end
     end
     error("SparseState: could not factor Q even with shift 2p·scale")
@@ -577,14 +693,13 @@ end
 # refactor happens once per sweep, not once per site)
 function ensure_fresh!(st::SparseState)
     if getfield(st, :stale) && !getfield(st, :frozen)
-        F, sh = _sparse_ldlt(getfield(st, :Q))          # CHOLMOD LDL', AMD ordering
-        st.F = F
+        F, sh = _sparse_ldlt!(st)                   # numeric-only refactor (cached ordering)
         st.shift = sh
         if sh > 0
             @warn "SparseState: Q lost positive-definiteness inside a sweep; factorizing Q + εI with ε=$sh" maxlog=1
         end
-        LinearAlgebra.ldiv!(getfield(st, :μ), st.F, getfield(st, :r))
-        st.logdetQ = logdet(st.F)
+        LinearAlgebra.ldiv!(getfield(st, :μ), F, getfield(st, :r))
+        st.logdetQ = logdet(F)
         st.stale = false
     end
     return st
@@ -633,7 +748,7 @@ function _post_sd!(buf::AbstractVector, st::SparseState)
     @inbounds for i in 1:p
         fill!(e, 0.0)
         e[i] = 1.0
-        buf[i] = sqrt(dot(e, F \ e))    # e_i' Q⁻¹ e_i
+        buf[i] = sqrt(max(dot(e, F \ e), 1e-12))    # e_i' Q⁻¹ e_i (clamped if Q lost PD)
     end
     return true
 end
@@ -664,6 +779,9 @@ end
 function reset!(st::SparseState, Q::AbstractMatrix, r::AbstractVector)
     st.Q = sparse(Q)          # replace (sparsity pattern may differ), not .= 
     st.r .= r
+    st.pat_colptr = Int[]     # invalidate the symbolic cache → re-analyze on next factor
+    st.pat_rowval = Int[]
+    st.iperm = Int[]
     st.stale = true
     st.frozen = false
     st.jacobi = false
@@ -725,21 +843,54 @@ function cavity(st::SparseState, A::AM, Qi::QM, ri::RV, power::Float64=1.0) wher
     (m = Sc * λc, S = Sc)
 end
 
-# accumulate a rank-1 update into the sparse Q/r. Unary sites (nnz(a)==1,
+# accumulate a rank-1 update into the sparse Q only. Unary sites (nnz(a)==1,
 # the GMRF case) touch a single diagonal entry — do it directly, avoiding an
 # O(p) sparse outer product + broadcast per site.
-function _rank1_update!(st::SparseState, a::AbstractVector, δq::Real, δr::Real)
+function _rank1_update_Q!(st::SparseState, a::AbstractVector, δq::Real)
     if a isa AbstractSparseVector && nnz(a) == 1
         i, v = findnz(a)
         st.Q[i[1], i[1]] += δq * v[1] * v[1]
-        st.r[i[1]] += δr * v[1]
     else
         sa = a isa AbstractSparseVector ? a : sparse(a)
         st.Q .+= δq .* (sa * sa')
-        st.r .+= δr .* sa
     end
+    return st
+end
+
+# accumulate a rank-1 update into the sparse Q/r and mark the factor stale
+# (refactor on next read)
+function _rank1_update!(st::SparseState, a::AbstractVector, δq::Real, δr::Real)
+    _rank1_update_Q!(st, a, δq)
+    sa = a isa AbstractSparseVector ? a : sparse(a)
+    st.r .+= δr .* sa
     st.stale = true
     return st
+end
+
+# In-place rank-1 up/downdate of the cached CHOLMOD factor:
+#   F ← factor of Q ± δq·a a'   via  lowrankupdowndate!(F, C, up),
+# with C = sqrt(|δq|)·a as a p×1 sparse matrix IN THE PERMUTED ORDER
+# (cholmod_updown expects C in the permuted order, C_passed = C_orig[perm],
+# i.e. rows iperm[i] for i in supp(a) — unpermuted C silently gives a wrong
+# factor; verified exact to 2e-16 with the permuted C). Cost is
+# O(nnz(L) on the etree path of supp(a)) — independent of the order in which
+# sites are updated, so no scheduling w.r.t. the ordering is needed; we never
+# reorder per update (reordering grows fill). Measured with sparse site rows:
+# 0.03 ms at p=2·10⁴ tridiagonal, 0.028 ms at p=10⁴ grid — vs 0.86/5.3 ms for a
+# numeric-only refactor, so per-site updown replaces the refactor-per-site.
+# A failed downdate corrupts the factor silently → issuccess check; on failure
+# the factor is marked stale and refactored from Q on the next read.
+function _updown_rank1!(st::SparseState, a::AbstractVector, δq::Real)
+    getfield(st, :stale) && return false
+    sa = a isa AbstractSparseVector ? a : sparse(a)
+    i, v = findnz(sa)
+    p = size(sa, 1)
+    iperm = getfield(st, :iperm)
+    C = SparseArrays.CHOLMOD.Sparse(sparse(iperm[i], ones(Int, length(i)), sqrt(abs(δq)) .* v, p, 1))
+    SparseArrays.CHOLMOD.lowrankupdowndate!(getfield(st, :F), C, δq > 0 ? Int32(1) : Int32(0))
+    ok = SparseArrays.CHOLMOD.issuccess(getfield(st, :F))
+    ok || setfield!(st, :stale, true)
+    return ok
 end
 
 # rank-1 apply: PD pre-check K = 1 + s·δq > 0 (the no-throw condition of a
@@ -782,7 +933,21 @@ function apply_site!(st::SparseState, a::AV, δq::Real, δr::Real, Sa, s::Float6
         K = 1 + s*δq
     end
     (K > 0 && abs(δr) <= rmax) || return nothing
-    _rank1_update!(st, a, δq, δr)      # sparse rank-1 update of Q
+    if !getfield(st, :frozen) && _updown_rank1!(st, a, δq)
+        # factor updated in place (stays fresh — no refactorization per site);
+        # mirror the update in Q (source of truth for the pattern and for exact
+        # resyncs) and update r, μ, logdetQ incrementally in O(p):
+        # μ⁺ = Σ⁺r⁺ = μ + (δr − (δq/K)(Sa'r + δr·s)) Sa  with the OLD Σ, r
+        c = δq / K
+        rSa = dot(Sa, getfield(st, :r))
+        _rank1_update_Q!(st, a, δq)
+        sa = a isa AbstractSparseVector ? a : sparse(a)
+        st.r .+= δr .* sa
+        st.logdetQ += log(K)
+        st.μ .+= (δr - c * (rSa + δr * s)) .* Sa
+        return (δq, δr)
+    end
+    _rank1_update!(st, a, δq, δr)      # sparse rank-1 update of Q, stale=true
     return (δq, δr)
 end
 

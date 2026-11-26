@@ -48,6 +48,23 @@ function log_dens(poisson::PoisLik, f, y)
     return y*f - exp(f) - lgamma(1.0 + y)
 end
 
+"""
+    PoisLikA(a)
+
+Poisson likelihood with exponential (log) link and rate scale `a`:
+`log_dens(PoisLikA(a), η, y) = y*(η + log a) - a*exp(η) - lgamma(1+y)`,
+i.e. `y ~ Poisson(a*exp(η))`. Used for binned Poisson-process counts in
+log-Gaussian Cox models, where `a` is the cell area (`PoisLik()` is the
+a = 1 special case). Tilted moments go through the generic quadrature path.
+"""
+struct PoisLikA <: Likelihood
+    a :: Float64
+end
+
+function log_dens(l::PoisLikA, f, y)
+    return y*(f + log(l.a)) - l.a*exp(f) - lgamma(1.0 + y)
+end
+
 #Bernoulli outcome with probit link: log_dens = log Φ(η) for y true, log Φ(-η)
 #otherwise. Tilted moments are analytic (see moments.jl), so quadrature is
 #only used for fractional EP (power ≠ 1).
